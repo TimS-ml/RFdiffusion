@@ -1,3 +1,16 @@
+"""
+Attention mechanisms and neural network building blocks.
+
+This module implements various attention mechanisms used in the RFdiffusion model:
+- Standard multi-head attention
+- Attention with learned bias (for incorporating pair/structure information)
+- MSA row and column attention (AlphaFold2-style)
+- Tied axial attention for efficient 2D feature processing
+- Feed-forward layers with residual connections
+
+These components are the core building blocks of the three-track architecture
+(MSA track, Pair track, Structure track) that processes protein information.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,6 +19,15 @@ from opt_einsum import contract as einsum
 from rfdiffusion.util_module import init_lecun_normal
 
 class FeedForwardLayer(nn.Module):
+    """
+    Position-wise feed-forward network with residual connection.
+
+    Applies two linear transformations with ReLU activation in between:
+    FFN(x) = Linear2(Dropout(ReLU(Linear1(LayerNorm(x)))))
+
+    This is used after attention layers to add non-linearity and increase
+    model capacity.
+    """
     def __init__(self, d_model, r_ff, p_drop=0.1):
         super(FeedForwardLayer, self).__init__()
         self.norm = nn.LayerNorm(d_model)
@@ -30,7 +52,15 @@ class FeedForwardLayer(nn.Module):
         return src
 
 class Attention(nn.Module):
-    # calculate multi-head attention
+    """
+    Standard multi-head attention mechanism.
+
+    Implements the scaled dot-product attention:
+    Attention(Q, K, V) = softmax(QK^T / sqrt(d)) V
+
+    Uses separate query, key, and value projections for each head, then
+    combines the outputs with a final linear projection.
+    """
     def __init__(self, d_query, d_key, n_head, d_hidden, d_out):
         super(Attention, self).__init__()
         self.h = n_head
@@ -76,6 +106,17 @@ class Attention(nn.Module):
         return out
 
 class AttentionWithBias(nn.Module):
+    """
+    Multi-head attention with learned bias and gating.
+
+    Extends standard attention with:
+    1. Learned bias added to attention logits (for incorporating pair features)
+    2. Gating mechanism to control information flow
+    3. Layer normalization on both input and bias
+
+    The bias allows the attention to be conditioned on pairwise information,
+    which is crucial for protein structure modeling.
+    """
     def __init__(self, d_in=256, d_bias=128, n_head=8, d_hidden=32):
         super(AttentionWithBias, self).__init__()
         self.norm_in = nn.LayerNorm(d_in)
@@ -134,8 +175,15 @@ class AttentionWithBias(nn.Module):
         out = self.to_out(out)
         return out
 
-# MSA Attention (row/column) from AlphaFold architecture
+# MSA Attention (row/column) inspired by AlphaFold architecture
 class SequenceWeight(nn.Module):
+    """
+    Compute sequence-wise attention weights for MSA processing.
+
+    Computes attention weights that determine how much each MSA sequence
+    contributes to the final representation. Uses the query sequence (first
+    sequence in MSA) to weight all sequences.
+    """
     def __init__(self, d_msa, n_head, d_hidden, p_drop=0.1):
         super(SequenceWeight, self).__init__()
         self.h = n_head
@@ -167,6 +215,17 @@ class SequenceWeight(nn.Module):
         return self.dropout(attn)
 
 class MSARowAttentionWithBias(nn.Module):
+    """
+    Row-wise attention over MSA sequences with pair bias.
+
+    For each residue position, attends over all MSA sequences at that position.
+    The attention is biased by pairwise information (from the pair track) to
+    incorporate structural context. Also uses sequence weighting to handle
+    varying MSA depths.
+
+    This is a key component of the MSA track that allows information exchange
+    between different sequences in the alignment.
+    """
     def __init__(self, d_msa=256, d_pair=128, n_head=8, d_hidden=32):
         super(MSARowAttentionWithBias, self).__init__()
         self.norm_msa = nn.LayerNorm(d_msa)
@@ -229,6 +288,16 @@ class MSARowAttentionWithBias(nn.Module):
         return out
 
 class MSAColAttention(nn.Module):
+    """
+    Column-wise attention over MSA residue positions.
+
+    For each MSA sequence, attends over all residue positions. This allows
+    information to flow along the sequence dimension, capturing long-range
+    dependencies within each aligned sequence.
+
+    Complementary to MSARowAttention: row attention mixes sequences, column
+    attention mixes positions.
+    """
     def __init__(self, d_msa=256, n_head=8, d_hidden=32):
         super(MSAColAttention, self).__init__()
         self.norm_msa = nn.LayerNorm(d_msa)
@@ -280,6 +349,14 @@ class MSAColAttention(nn.Module):
         return out
 
 class MSAColGlobalAttention(nn.Module):
+    """
+    Global column attention with shared query across all sequences.
+
+    A memory-efficient variant of MSAColAttention that uses a single global
+    query (averaged over sequences) instead of per-sequence queries. This
+    reduces memory usage for large MSAs while maintaining the ability to
+    capture long-range position dependencies.
+    """
     def __init__(self, d_msa=64, n_head=8, d_hidden=8):
         super(MSAColGlobalAttention, self).__init__()
         self.norm_msa = nn.LayerNorm(d_msa)
@@ -331,8 +408,18 @@ class MSAColGlobalAttention(nn.Module):
         out = self.to_out(out)
         return out
 
-# Instead of triangle attention, use Tied axail attention with bias from coordinates..?
 class BiasedAxialAttention(nn.Module):
+    """
+    Tied axial attention with structural bias for 2D pair features.
+
+    Processes 2D pair representations (L x L) using tied attention along one axis
+    (either row or column). "Tied" means the same attention weights are shared
+    across the other axis, which is more parameter-efficient than full 2D attention.
+
+    The attention is biased by structural information (e.g., distances) to
+    incorporate geometric constraints. This is used in the Pair track to update
+    pairwise residue features.
+    """
     def __init__(self, d_pair, d_bias, n_head, d_hidden, p_drop=0.1, is_row=True):
         super(BiasedAxialAttention, self).__init__()
         #

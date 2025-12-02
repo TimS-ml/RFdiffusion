@@ -1,7 +1,27 @@
+"""
+Scoring parameters for protein physics and energy calculations.
 
-##
-## lk and lk term
-#(LJ_RADIUS LJ_WDEPTH LK_DGFREE LK_LAMBDA LK_VOLUME)
+This module defines physical parameters used for protein structure scoring,
+including:
+- Lennard-Jones (LJ) parameters for van der Waals interactions
+- Lazaridis-Karplus (LK) solvation parameters
+- Hydrogen bonding parameters and polynomial coefficients
+- Atom type classifications for donors/acceptors
+
+These parameters are derived from the Rosetta energy function and are used
+to evaluate the physical realism of generated protein structures.
+
+The parameters are organized by atom types (e.g., backbone atoms, sidechain
+atoms) and interaction types (e.g., hydrogen bond donor/acceptor pairs).
+"""
+
+# Lennard-Jones and Lazaridis-Karplus solvation parameters
+# Format: (LJ_RADIUS, LJ_WDEPTH, LK_DGFREE, LK_LAMBDA, LK_VOLUME)
+# - LJ_RADIUS: Lennard-Jones radius in Angstroms
+# - LJ_WDEPTH: Lennard-Jones well depth in kcal/mol
+# - LK_DGFREE: Solvation free energy in kcal/mol
+# - LK_LAMBDA: Solvation length scale in Angstroms
+# - LK_VOLUME: Effective atomic volume in cubic Angstroms
 type2ljlk = {
     "CNH2":(1.968297,0.094638,3.077030,3.5000,13.500000),
     "COO":(1.916661,0.141799,-3.332648,3.5000,14.653000),
@@ -34,8 +54,18 @@ type2ljlk = {
     "HS":(0.363887,0.050836,0.0000,3.5000,0.0000),
 }
 
-# hbond donor/acceptors
+# Hydrogen bond donor/acceptor classification
 class HbAtom:
+    """
+    Enumeration for hydrogen bonding capability of atoms.
+
+    Attributes:
+        NO: Not a hydrogen bond donor or acceptor
+        DO: Hydrogen bond donor only
+        AC: Hydrogen bond acceptor only
+        DA: Both donor and acceptor
+        HP: Polar hydrogen (attached to donor)
+    """
     NO = 0
     DO = 1 # donor
     AC = 2 # acceptor
@@ -53,9 +83,25 @@ type2hb = {
     "HS":HbAtom.HP, # HP in rosetta(?)
 }
 
-##
-## hbond term
+# Hydrogen bond donor type classification
 class HbDonType:
+    """
+    Enumeration for hydrogen bond donor types.
+
+    Different donor types have different geometric preferences and strengths.
+    These correspond to chemical contexts (backbone, sidechain amide, etc.)
+
+    Attributes:
+        PBA: Protein backbone amide (backbone N-H)
+        IND: Indole (Trp N-H)
+        IME: Imidazole (His N-H, when protonated)
+        GDE: Guanidinium (Arg)
+        CXA: Carboxamide (Asn, Gln)
+        AMO: Ammonium (Lys)
+        HXL: Hydroxyl (Ser, Thr)
+        AHX: Aromatic hydroxyl (Tyr)
+        NTYPES: Total number of donor types
+    """
     PBA = 0
     IND = 1
     IME = 2
@@ -67,6 +113,18 @@ class HbDonType:
     NTYPES = 8
 
 class HbAccType:
+    """
+    Enumeration for hydrogen bond acceptor types.
+
+    Attributes:
+        PBA: Protein backbone amide carbonyl (C=O)
+        CXA: Carboxamide (Asn, Gln)
+        CXL: Carboxylate (Asp, Glu)
+        HXL: Hydroxyl (Ser, Thr)
+        AHX: Aromatic hydroxyl (Tyr)
+        IME: Imidazole (His, when deprotonated)
+        NTYPES: Total number of acceptor types
+    """
     PBA = 0
     CXA = 1
     CXL = 2
@@ -76,6 +134,17 @@ class HbAccType:
     NTYPES = 6
 
 class HbHybType:
+    """
+    Enumeration for hybridization types of acceptor atoms.
+
+    The hybridization affects the geometric preferences for hydrogen bonding.
+
+    Attributes:
+        SP2: sp2 hybridization (planar geometry, e.g., carbonyl oxygen)
+        SP3: sp3 hybridization (tetrahedral geometry, e.g., hydroxyl oxygen)
+        RING: Ring nitrogen (e.g., His)
+        NTYPES: Total number of hybridization types
+    """
     SP2 = 0
     SP3 = 1
     RING = 2
@@ -131,6 +200,14 @@ acctype2wt = {
 }
 
 class HbPolyType:
+    """
+    Enumeration for hydrogen bond polynomial types.
+
+    Each donor-acceptor pair has associated polynomial functions that describe
+    the energy as a function of geometric parameters (distance, angles).
+    These polynomials are indexed by combinations of donor and acceptor residue
+    types and geometric features.
+    """
     ahdist_aASN_dARG = 0
     ahdist_aASN_dASN = 1
     ahdist_aASN_dGLY = 2
@@ -187,7 +264,9 @@ class HbPolyType:
     AHD_1j = 53
     AHD_1k = 54
 
-# map donor:acceptor pairs to polynomials
+# Map donor-acceptor type pairs to their polynomial indices
+# Each tuple contains (distance_poly, angle1_poly, angle2_poly) indices
+# These polynomials define the energy landscape for that specific H-bond geometry
 hbtypepair2poly = {
   (HbDonType.PBA,HbAccType.PBA): (HbPolyType.ahdist_aGLY_dGLY,HbPolyType.cosBAH_off,HbPolyType.AHD_1j),
   (HbDonType.CXA,HbAccType.PBA): (HbPolyType.ahdist_aGLY_dASN,HbPolyType.cosBAH_off,HbPolyType.AHD_1j),
@@ -240,8 +319,13 @@ hbtypepair2poly = {
 }
 
 
-# polynomials are triplets, (x_min, x_max), (y[x<x_min],y[x>x_max]), (c_9,...,c_0)
-hbpolytype2coeffs = { # Parameters imported from rosetta sp2_elec_params @v2017.48-dev59886
+# Polynomial coefficients for hydrogen bond energy functions
+# Each entry is a tuple: ((x_min, x_max), (y_min, y_max), (c_9, c_8, ..., c_0))
+# - (x_min, x_max): valid range for the polynomial
+# - (y_min, y_max): constant values returned outside the valid range
+# - (c_9, ..., c_0): 10th-order polynomial coefficients (highest to lowest degree)
+# Parameters imported from Rosetta sp2_elec_params @v2017.48-dev59886
+hbpolytype2coeffs = {
     HbPolyType.ahdist_aASN_dARG: ((0.7019094761929999, 2.86820307153,),(1.1, 1.1,),( 0.58376113, -9.29345473, 64.86270904, -260.3946711, 661.43138077, -1098.01378958, 1183.58371466, -790.82929582, 291.33125475, -43.01629727,)),
     HbPolyType.ahdist_aASN_dASN: ((0.625841094801, 2.75107708444,),(1.1, 1.1,),( -1.31243015, 18.6745072, -112.63858313, 373.32878091, -734.99145504, 861.38324861, -556.21026097, 143.5626977, 20.03238394, -11.52167705,)),
     HbPolyType.ahdist_aASN_dGLY: ((0.7477341047139999, 2.6796350782799996,),(1.1, 1.1,),( -1.61294554, 23.3150793, -144.11313069, 496.13575, -1037.83809166, 1348.76826073, -1065.14368678, 473.89008925, -100.41142701, 7.44453515,)),

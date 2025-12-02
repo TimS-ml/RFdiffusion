@@ -1,3 +1,16 @@
+"""
+Embedding modules for initializing neural network features.
+
+This module contains classes for generating initial embeddings from raw protein
+structure data. Key components include:
+- MSA (Multiple Sequence Alignment) embeddings with positional encoding
+- Template structure embeddings (both 2D pair and 1D torsion features)
+- Positional encodings for relative residue positions
+- Recycling embeddings for iterative refinement
+
+These embeddings transform raw input data (sequences, templates, coordinates) into
+rich learned representations that serve as input to the main network architecture.
+"""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -8,12 +21,16 @@ from rfdiffusion.util_module import Dropout, create_custom_forward, rbf, init_le
 from rfdiffusion.Attention_module import Attention, FeedForwardLayer, AttentionWithBias
 from rfdiffusion.Track_module import PairStr2Pair
 import math
-import numpy as np 
-
-# Module contains classes and functions to generate initial embeddings
+import numpy as np
 
 class PositionalEncoding2D(nn.Module):
-    # Add relative positional encoding to pair features
+    """
+    2D relative positional encoding for residue pairs.
+
+    Encodes the relative sequence separation between residues i and j as a learned
+    embedding. Supports cyclic peptides where the N and C termini are connected.
+    Also handles multi-chain complexes by detecting chain breaks.
+    """
     def __init__(self, d_model, minpos=-32, maxpos=32, p_drop=0.1):
         super(PositionalEncoding2D, self).__init__()
         self.minpos = minpos
@@ -56,7 +73,17 @@ class PositionalEncoding2D(nn.Module):
         return self.drop(x)
 
 class MSA_emb(nn.Module):
-    # Get initial seed MSA embedding
+    """
+    Generate initial embeddings from MSA and sequence data.
+
+    Creates three types of embeddings:
+    1. MSA embeddings: Learned representations of the MSA with query sequence bias
+    2. Pair embeddings: Pairwise features combining left/right sequence embeddings
+       and relative positional encoding
+    3. State embeddings: Per-residue state representations
+
+    These serve as the initial features for the iterative refinement network.
+    """
     def __init__(self, d_msa=256, d_pair=128, d_state=32, d_init=22+22+2+2,
                  minpos=-32, maxpos=32, p_drop=0.1, input_seq_onehot=False):
         super(MSA_emb, self).__init__()
@@ -115,7 +142,13 @@ class MSA_emb(nn.Module):
         return msa, pair, state
 
 class Extra_emb(nn.Module):
-    # Get initial seed MSA embedding
+    """
+    Generate embeddings for extra MSA sequences.
+
+    Similar to MSA_emb but designed for processing additional MSA sequences
+    (beyond the primary seed sequences). Uses a simpler architecture without
+    pair or state embeddings.
+    """
     def __init__(self, d_msa=256, d_init=22+1+2, p_drop=0.1, input_seq_onehot=False):
         super(Extra_emb, self).__init__()
         self.emb = nn.Linear(d_init, d_msa) # embedding for general MSA
@@ -146,8 +179,13 @@ class Extra_emb(nn.Module):
         return self.drop(msa)
 
 class TemplatePairStack(nn.Module):
-    # process template pairwise features
-    # use structure-biased attention
+    """
+    Process template pairwise features with structure-biased attention.
+
+    Applies multiple blocks of attention and updates to template pair features,
+    conditioned on structural information (CA-CA distances via RBF features).
+    This refines the template representations before mixing with query features.
+    """
     def __init__(self, n_block=2, d_templ=64, n_head=4, d_hidden=16, p_drop=0.25):
         super(TemplatePairStack, self).__init__()
         self.n_block = n_block
@@ -197,18 +235,22 @@ class TemplateTorsionStack(nn.Module):
         return self.norm(tors).reshape(B, T, L, -1)
 
 class Templ_emb(nn.Module):
-    # Get template embedding
-    # Features are
-    #   t2d:
-    #   - 37 distogram bins + 6 orientations (43)
-    #   - Mask (missing/unaligned) (1)
-    #   t1d:
-    #   - tiled AA sequence (20 standard aa + gap)
-    #   - confidence (1)
-    #   - contacting or note (1). NB this is added for diffusion model. Used only in complex training examples - 1 signifies that a residue in the non-diffused chain\
-    #     i.e. the context, is in contact with the diffused chain.
-    #
-    #Added extra t1d dimension for contacting or not
+    """
+    Generate embeddings from template structures.
+
+    Processes template information to create enhanced pair and state features:
+    - Template 2D features (t2d): distance bins (37) + orientations (6) + mask (1) = 44
+    - Template 1D features (t1d): amino acid sequence (21) + confidence (1) +
+      contact indicator (1) = 23
+    - Template torsion angles (alpha_t): chi angles and backbone torsions
+
+    The template information is processed through attention mechanisms and then
+    mixed with the query pair and state features to incorporate structural
+    information from homologous proteins.
+
+    The contact indicator is used during complex training to mark residues in
+    the non-diffused chain (context) that contact the diffused chain.
+    """
     def __init__(self, d_t1d=21+1+1, d_t2d=43+1, d_tor=30, d_pair=128, d_state=32,
                  n_block=2, d_templ=64,
                  n_head=4, d_hidden=16, p_drop=0.25):
@@ -288,6 +330,17 @@ class Templ_emb(nn.Module):
         return pair, state
 
 class Recycling(nn.Module):
+    """
+    Recycling module for iterative refinement.
+
+    Incorporates information from previous iterations by processing:
+    - Previous structure (xyz coordinates converted to distance features)
+    - Previous state features
+    - Previous MSA and pair features
+
+    This allows the network to refine its predictions iteratively, similar to
+    the recycling mechanism in AlphaFold2.
+    """
     def __init__(self, d_msa=256, d_pair=128, d_state=32):
         super(Recycling, self).__init__()
         self.proj_dist = nn.Linear(36+d_state*2, d_pair)

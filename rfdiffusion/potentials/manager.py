@@ -1,17 +1,31 @@
+"""
+Potential energy management for guided diffusion.
+
+This module manages the application of guiding potential functions during
+diffusion sampling. It handles contact matrices for symmetric assemblies,
+potential initialization, and gradient computation for structure guidance.
+"""
 import torch
 from rfdiffusion.potentials import potentials as potentials
-import numpy as np 
+import numpy as np
 
 
 def make_contact_matrix(nchain, intra_all=False, inter_all=False, contact_string=None):
     """
-    Calculate a matrix of inter/intra chain contact indicators
-    
-    Parameters:
-        nchain (int, required): How many chains are in this design 
-        
-        contact_str (str, optional): String denoting how to define contacts, comma delimited between pairs of chains
-            '!' denotes repulsive, '&' denotes attractive
+    Create a contact matrix for inter/intra-chain interactions.
+
+    Builds a matrix indicating which chain pairs should have attractive (1),
+    repulsive (-1), or no (0) contact potentials in symmetric oligomers.
+
+    Args:
+        nchain (int): Number of chains in the design
+        intra_all (bool): Apply contact potential to all intra-chain pairs
+        inter_all (bool): Apply contact potential to all inter-chain pairs
+        contact_string (str, optional): Custom contact specification (e.g., 'A&B,B!C')
+            '&' denotes attractive, '!' denotes repulsive
+
+    Returns:
+        np.ndarray: Contact matrix [nchain, nchain] with values -1, 0, or 1
     """
     alphabet   = [a for a in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ']
     letter2num = {a:i for i,a in enumerate(alphabet)}
@@ -57,7 +71,14 @@ def make_contact_matrix(nchain, intra_all=False, inter_all=False, contact_string
 
 def calc_nchains(symbol, components=1):
     """
-    Calculates number of chains for given symmetry 
+    Calculate total number of chains for a given symmetry.
+
+    Args:
+        symbol (str): Symmetry symbol (e.g., 'C3', 'D2', 'T')
+        components (int): Number of asymmetric units
+
+    Returns:
+        int: Total number of chains in the symmetric assembly
     """
     S = symbol.lower()
 
@@ -74,21 +95,42 @@ def calc_nchains(symbol, components=1):
 
 
 class PotentialManager:
-    '''
-        Class to define a set of potentials from the given config object and to apply all of the specified potentials
-        during each cycle of the inference loop.
+    """
+    Manager for guiding potential functions during diffusion sampling.
 
-        Author: NRB
-    '''
+    This class initializes and applies various potential energy functions that
+    guide the diffusion process toward desired structural properties. It handles
+    potential scaling, decay schedules, and gradient computation for structure
+    optimization.
 
-    def __init__(self, 
-                 potentials_config, 
-                 ppi_config, 
-                 diffuser_config, 
+    Supports potentials for:
+    - Radius of gyration (compactness)
+    - Interface/binder contacts
+    - Substrate/ligand interactions
+    - Symmetric oligomer contacts
+
+    Author: NRB
+    """
+
+    def __init__(self,
+                 potentials_config,
+                 ppi_config,
+                 diffuser_config,
                  inference_config,
                  hotspot_0idx,
                  binderlen,
                  ):
+        """
+        Initialize potential manager.
+
+        Args:
+            potentials_config: Configuration for potential functions
+            ppi_config: Protein-protein interaction configuration
+            diffuser_config: Diffusion process configuration
+            inference_config: Inference settings including symmetry
+            hotspot_0idx (list): 0-indexed hotspot residue positions
+            binderlen (int): Length of binder chain
+        """
 
         self.potentials_config = potentials_config
         self.ppi_config        = ppi_config
@@ -117,19 +159,31 @@ class PotentialManager:
         self.T = diffuser_config.T
         
     def is_empty(self):
-        '''
-            Check whether this instance of PotentialManager actually contains any potentials
-        '''
+        """
+        Check if any potentials are configured.
+
+        Returns:
+            bool: True if no potentials are active, False otherwise
+        """
 
         return len(self.potentials_to_apply) == 0
 
     def parse_potential_string(self, potstr):
-        '''
-            Parse a single entry in the list of potentials to be run to a dictionary of settings for that potential.
+        """
+        Parse potential configuration string to dictionary.
 
-            An example of how this parsing is done:
-            'setting1:val1,setting2:val2,setting3:val3' -> {setting1:val1,setting2:val2,setting3:val3}
-        '''
+        Converts a string specification into a dictionary of potential settings.
+
+        Args:
+            potstr (str): Configuration string (e.g., 'type:binder_ROG,weight:1.0')
+
+        Returns:
+            dict: Parsed settings dictionary
+
+        Example:
+            'type:binder_ROG,weight:1.0,min_dist:15' ->
+            {'type': 'binder_ROG', 'weight': 1.0, 'min_dist': 15.0}
+        """
 
         setting_dict = {entry.split(':')[0]:entry.split(':')[1] for entry in potstr.split(',')}
 
@@ -139,10 +193,15 @@ class PotentialManager:
         return setting_dict
 
     def initialize_all_potentials(self, setting_list):
-        '''
-            Given a list of potential dictionaries where each dictionary defines the configurations for a single potential,
-            initialize all potentials and add to the list of potentials to be applies
-        '''
+        """
+        Initialize all potential functions from configuration.
+
+        Args:
+            setting_list (list): List of potential configuration dictionaries
+
+        Returns:
+            list: List of initialized potential objects
+        """
 
         to_apply = []
 
@@ -168,9 +227,17 @@ class PotentialManager:
         return to_apply
 
     def compute_all_potentials(self, xyz):
-        '''
-            This is the money call. Take the current sequence and structure information and get the sum of all of the potentials that are being used
-        '''
+        """
+        Compute the sum of all active potential functions.
+
+        This is the main function called during sampling to evaluate guiding potentials.
+
+        Args:
+            xyz (torch.Tensor): Current coordinates [L, 27, 3]
+
+        Returns:
+            torch.Tensor: Total potential energy (scalar to be maximized)
+        """
 
         potential_list = [potential.compute(xyz) for potential in self.potentials_to_apply]
         potential_stack = torch.stack(potential_list, dim=0)
@@ -178,18 +245,18 @@ class PotentialManager:
         return torch.sum(potential_stack, dim=0)
 
     def get_guide_scale(self, t):
-        '''
-        Given a timestep and a decay type, get the appropriate scale factor to use for applying guiding potentials
-        
-        Inputs:
-        
-            t (int, required):          The current timestep
-        
-        Output:
-        
-            scale (int):                The scale factor to use for applying guiding potentials
-        
-        '''
+        """
+        Get the scale factor for guiding potentials at a given timestep.
+
+        The scale factor can follow different schedules (constant, linear, quadratic, cubic)
+        to control how strongly potentials influence the diffusion process over time.
+
+        Args:
+            t (int): Current timestep
+
+        Returns:
+            float: Scale factor for applying potential gradients
+        """
         
         implemented_decay_types = {
                 'constant': lambda t: self.guide_scale,

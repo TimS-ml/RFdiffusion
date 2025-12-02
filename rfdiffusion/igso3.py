@@ -1,4 +1,22 @@
-"""SO(3) diffusion methods."""
+"""
+SO(3) diffusion methods for protein backbone orientations.
+
+This module implements the Isotropic Gaussian SO(3) (IGSO3) distribution and associated
+operations for diffusion on the 3D rotation group. Key functionality includes:
+- Geometric operations on SO(3): exponential/logarithmic maps, hat operator
+- IGSO3 probability density function via truncated power series
+- Score (gradient of log-density) computation for the IGSO3 distribution
+- Sampling from IGSO3 via inverse CDF method
+- Pre-computation and caching of IGSO3 values for efficiency
+
+The IGSO3 distribution is the isotropic (rotation-axis-uniform) Gaussian on SO(3),
+analogous to an isotropic Gaussian in Euclidean space. It's parameterized by a
+scale parameter sigma, with larger sigma indicating more rotational dispersion.
+
+Reference:
+Leach et al. (2022). "Denoising Diffusion Probabilistic Models on SO(3) for
+Rotational Alignment". NeurIPS Workshop.
+"""
 import numpy as np
 import os
 from functools import cached_property
@@ -7,26 +25,77 @@ from scipy.spatial.transform import Rotation
 import scipy.linalg
 
 
-### First define geometric operations on the SO3 manifold
+### Geometric operations on the SO(3) manifold
 
-# hat map from vector space R^3 to Lie algebra so(3)
 def hat(v):
+    """
+    Hat operator: map from R^3 to so(3) (Lie algebra of SO(3)).
+
+    Converts a rotation vector into its skew-symmetric matrix representation.
+    This is the inverse of the vee operator.
+
+    Args:
+        v (torch.Tensor): Rotation vectors of shape (N, 3)
+
+    Returns:
+        torch.Tensor: Skew-symmetric matrices of shape (N, 3, 3)
+    """
     hat_v = torch.zeros([v.shape[0], 3, 3])
     hat_v[:, 0, 1], hat_v[:, 0, 2], hat_v[:, 1, 2] = -v[:, 2], v[:, 1], -v[:, 0]
     return hat_v + -hat_v.transpose(2, 1)
 
-# Logarithmic map from SO(3) to R^3 (i.e. rotation vector)
-def Log(R): return torch.tensor(Rotation.from_matrix(R.numpy()).as_rotvec())
-    
-# logarithmic map from SO(3) to so(3), this is the matrix logarithm
-def log(R): return hat(Log(R))
+def Log(R):
+    """
+    Logarithmic map from SO(3) to R^3 (rotation vector representation).
 
-# Exponential map from vector space of so(3) to SO(3), this is the matrix
-# exponential combined with the "hat" map
-def Exp(A): return torch.tensor(Rotation.from_rotvec(A.numpy()).as_matrix())
+    Args:
+        R (torch.Tensor): Rotation matrices of shape (..., 3, 3)
 
-# Angle of rotation SO(3) to R^+
-def Omega(R): return np.linalg.norm(log(R), axis=[-2, -1])/np.sqrt(2.)
+    Returns:
+        torch.Tensor: Rotation vectors of shape (..., 3)
+    """
+    return torch.tensor(Rotation.from_matrix(R.numpy()).as_rotvec())
+
+def log(R):
+    """
+    Matrix logarithm from SO(3) to so(3) (Lie algebra).
+
+    Args:
+        R (torch.Tensor): Rotation matrices
+
+    Returns:
+        torch.Tensor: Skew-symmetric matrices in so(3)
+    """
+    return hat(Log(R))
+
+def Exp(A):
+    """
+    Exponential map from R^3 to SO(3).
+
+    Converts rotation vectors to rotation matrices using the matrix exponential.
+
+    Args:
+        A (torch.Tensor): Rotation vectors of shape (..., 3)
+
+    Returns:
+        torch.Tensor: Rotation matrices of shape (..., 3, 3)
+    """
+    return torch.tensor(Rotation.from_rotvec(A.numpy()).as_matrix())
+
+def Omega(R):
+    """
+    Extract rotation angle from a rotation matrix.
+
+    Computes the magnitude of rotation represented by R, which is the angle
+    of rotation around the rotation axis.
+
+    Args:
+        R: Rotation matrices
+
+    Returns:
+        np.ndarray: Rotation angles in radians
+    """
+    return np.linalg.norm(log(R), axis=[-2, -1])/np.sqrt(2.)
 
 L_default = 2000
 def f_igso3(omega, t, L=L_default):
@@ -72,17 +141,30 @@ def igso3_score(R, t, L=L_default):
     return unit_vector * d_logf_d_omega(omega, t, L)[:, None, None]
 
 def calculate_igso3(*, num_sigma, num_omega, min_sigma, max_sigma):
-    """calculate_igso3 pre-computes numerical approximations to the IGSO3 cdfs
-    and score norms and expected squared score norms.
+    """
+    Pre-compute numerical approximations for IGSO3 distribution quantities.
+
+    Computes and caches values needed for efficient IGSO3 sampling and score
+    computation, including PDFs, CDFs, and score norms. These values are
+    discretized over a grid of sigma and omega values.
+
+    The computation is expensive but only needs to be done once and can be cached.
 
     Args:
-        num_sigma: number of different sigmas for which to compute igso3
-            quantities.
-        num_omega: number of point in the discretization in the angle of
-            rotation.
-        min_sigma, max_sigma: the upper and lower ranges for the angle of
-            rotation on which to consider the IGSO3 distribution.  This cannot
-            be too low or it will create numerical instability.
+        num_sigma (int): Number of discretization points for sigma (scale parameter)
+        num_omega (int): Number of discretization points for omega (rotation angle)
+            in the interval [0, pi]
+        min_sigma (float): Minimum sigma value (must be > 0 for numerical stability,
+            typically >= 0.01, recommended 0.05)
+        max_sigma (float): Maximum sigma value
+
+    Returns:
+        dict: Dictionary containing:
+            - 'cdf': Cumulative distribution functions of shape (num_sigma, num_omega)
+            - 'score_norm': Score norms of shape (num_sigma, num_omega)
+            - 'exp_score_norms': Expected score norms of shape (num_sigma,)
+            - 'discrete_omega': Discretized omega values of shape (num_omega,)
+            - 'discrete_sigma': Discretized sigma values of shape (num_sigma,)
     """
     # Discretize omegas for calculating CDFs. Skip omega=0.
     discrete_omega = np.linspace(0, np.pi, num_omega+1)[1:]

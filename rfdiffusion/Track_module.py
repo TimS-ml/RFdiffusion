@@ -1,16 +1,45 @@
+"""
+Three-track neural network architecture for protein structure modeling.
+
+This module implements the core three-track architecture of RFdiffusion:
+1. MSA Track: Processes multiple sequence alignment information
+2. Pair Track: Processes pairwise residue relationships
+3. Structure Track: Processes 3D geometric information via SE(3) equivariance
+
+The tracks interact through cross-track updates:
+- MSA features are updated using pair and structure information
+- Pair features are updated using MSA coevolution signals and structure
+- Structure is updated using MSA node features and pair edge features
+
+This design allows the model to jointly reason about sequence, evolutionary
+relationships, and 3D geometry, which is crucial for protein design.
+
+Key components:
+- MSAPairStr2MSA: Update MSA using pair and structure information
+- PairStr2Pair: Update pair features with structural bias
+- MSA2Pair: Extract coevolution information from MSA
+- Str2Str: SE(3)-equivariant structure updates with sidechain prediction
+- IterBlock: Single iteration combining all track updates
+- IterativeSimulator: Full iterative refinement with multiple blocks
+"""
 import torch.utils.checkpoint as checkpoint
 from rfdiffusion.util_module import *
 from rfdiffusion.Attention_module import *
 from rfdiffusion.SE3_network import SE3TransformerWrapper
 
-# Components for three-track blocks
-# 1. MSA -> MSA update (biased attention. bias from pair & structure)
-# 2. Pair -> Pair update (biased attention. bias from structure)
-# 3. MSA -> Pair update (extract coevolution signal)
-# 4. Str -> Str update (node from MSA, edge from Pair)
-
-# Update MSA with biased self-attention. bias from Pair & Str
 class MSAPairStr2MSA(nn.Module):
+    """
+    Update MSA track using information from pair and structure tracks.
+
+    Combines:
+    1. Pair features (distance, contacts) as attention bias
+    2. Structure features (SE3 node outputs) added to query sequence
+    3. Row attention over sequences (with pair bias)
+    4. Column attention over positions
+    5. Feed-forward transformation
+
+    This allows the MSA representation to incorporate 3D structural context.
+    """
     def __init__(self, d_msa=256, d_pair=128, n_head=8, d_state=16,
                  d_hidden=32, p_drop=0.15, use_global_attn=False):
         super(MSAPairStr2MSA, self).__init__()
@@ -70,6 +99,15 @@ class MSAPairStr2MSA(nn.Module):
         return msa
 
 class PairStr2Pair(nn.Module):
+    """
+    Update pair track using structural information.
+
+    Applies biased axial attention (row and column) to pair features, where
+    the bias comes from structural information (RBF-encoded CA-CA distances).
+    This allows pairwise features to be refined based on current 3D geometry.
+
+    Used both for processing templates and updating the main pair track.
+    """
     def __init__(self, d_pair=128, n_head=4, d_hidden=32, d_rbf=36, p_drop=0.15):
         super(PairStr2Pair, self).__init__()
         
@@ -104,6 +142,16 @@ class PairStr2Pair(nn.Module):
         return pair
 
 class MSA2Pair(nn.Module):
+    """
+    Extract pairwise coevolution information from MSA.
+
+    Implements the outer product mean operation from AlphaFold2:
+    For each pair of positions (i,j), computes the outer product of MSA
+    features at those positions, averaged over all sequences. This captures
+    coevolutionary signals that indicate residue-residue contacts.
+
+    The extracted information is added to the pair track.
+    """
     def __init__(self, d_msa=256, d_pair=128, d_hidden=32, p_drop=0.15):
         super(MSA2Pair, self).__init__()
         self.norm = nn.LayerNorm(d_msa)
@@ -138,6 +186,18 @@ class MSA2Pair(nn.Module):
         return pair
 
 class SCPred(nn.Module):
+    """
+    Predict sidechain torsion angles and backbone geometry.
+
+    Predicts 10 torsion angles (as cos/sin pairs):
+    - Backbone: phi, psi, omega
+    - Sidechain: chi1, chi2, chi3, chi4
+    - Additional: CB bend, CB twist, CG bend
+
+    Uses a small ResNet architecture combining MSA query features and
+    SE(3) node features to make predictions conditioned on both sequence
+    and current structure.
+    """
     def __init__(self, d_msa=256, d_state=32, d_hidden=128, p_drop=0.15):
         super(SCPred, self).__init__()
         self.norm_s0 = nn.LayerNorm(d_msa)
@@ -199,6 +259,21 @@ class SCPred(nn.Module):
 
 
 class Str2Str(nn.Module):
+    """
+    Update structure track using SE(3)-equivariant transformer.
+
+    This is the core geometric reasoning module that:
+    1. Embeds MSA query and state features as node features
+    2. Embeds pair features and distances as edge features
+    3. Applies SE(3)-equivariant message passing (preserves rotational symmetry)
+    4. Predicts structure updates (rotations and translations)
+    5. Predicts sidechain torsion angles
+
+    The SE(3) equivariance ensures that the predictions are independent of the
+    global reference frame, which is a key inductive bias for protein structure.
+
+    Motif residues (if specified) are not updated, allowing for motif scaffolding.
+    """
     def __init__(self, d_msa=256, d_pair=128, d_state=16, 
             SE3_param={'l0_in_features':32, 'l0_out_features':16, 'num_edge_features':32}, p_drop=0.1):
         super(Str2Str, self).__init__()
@@ -294,6 +369,20 @@ class Str2Str(nn.Module):
         return Ri, Ti, state, alpha
 
 class IterBlock(nn.Module):
+    """
+    Single iteration block combining all three track updates.
+
+    Executes one round of updates in sequence:
+    1. MSA track update (MSAPairStr2MSA)
+    2. MSA to Pair communication (MSA2Pair)
+    3. Pair track update (PairStr2Pair)
+    4. Structure track update (Str2Str)
+
+    The tracks are updated in this order to allow information to flow:
+    MSA -> Pair -> Structure, with feedback from Structure back to MSA.
+
+    Can use gradient checkpointing to save memory during training.
+    """
     def __init__(self, d_msa=256, d_pair=128,
                  n_head_msa=8, n_head_pair=4,
                  use_global_attn=False,
@@ -334,6 +423,29 @@ class IterBlock(nn.Module):
         return msa, pair, R, T, state, alpha
 
 class IterativeSimulator(nn.Module):
+    """
+    Full iterative structure refinement with multiple iteration blocks.
+
+    Implements a multi-stage refinement process:
+    1. Extra blocks: Process full MSA (including extra sequences) with global attention
+    2. Main blocks: Process seed MSA with standard attention
+    3. Refinement blocks: Final SE(3) refinement with top-k graph (for efficiency)
+
+    The model maintains three tracks (MSA, Pair, Structure) and iteratively
+    refines them through multiple blocks. Each block updates the structure,
+    and the process is repeated with gradient stops between iterations for
+    stability.
+
+    The network progressively refines the structure from coarse to fine:
+    - Early blocks use more sequences and full graphs
+    - Later blocks use fewer sequences and sparse graphs for efficiency
+
+    Returns rotation/translation trajectories and torsion angle predictions
+    for all iterations, which can be used for:
+    - Training with intermediate supervision
+    - Sampling diverse structures during generation
+    - Analyzing the refinement process
+    """
     def __init__(self, n_extra_block=4, n_main_block=12, n_ref_block=4,
                  d_msa=256, d_msa_full=64, d_pair=128, d_hidden=32,
                  n_head_msa=8, n_head_pair=4,
