@@ -1,9 +1,31 @@
+"""
+Utility functions for protein structure manipulation and analysis.
+
+This module provides geometric calculations, coordinate transformations,
+torsion angle computations, and PDB writing functionality for protein structures.
+"""
+
 import scipy.sparse
 from rfdiffusion.chemical import *
 from rfdiffusion.scoring import *
 
 
 def generate_Cbeta(N, Ca, C):
+    """
+    Generate C-beta atom coordinates from backbone N, CA, C atoms.
+
+    Uses the ideal geometry to recreate CB position from the three
+    backbone atoms. This is useful for glycine (which has no CB) or
+    for validating sidechain placement.
+
+    Args:
+        N: N atom coordinates (tensor)
+        Ca: CA atom coordinates (tensor)
+        C: C atom coordinates (tensor)
+
+    Returns:
+        Cb: Reconstructed CB atom coordinates
+    """
     # recreate Cb given N,Ca,C
     b = Ca - N
     c = C - Ca
@@ -17,6 +39,20 @@ def generate_Cbeta(N, Ca, C):
 
 
 def th_ang_v(ab, bc, eps: float = 1e-8):
+    """
+    Calculate bond angle between two vectors using PyTorch.
+
+    Computes the angle between vectors ab and bc, returning both
+    cosine and sine components for numerical stability.
+
+    Args:
+        ab: First vector
+        bc: Second vector
+        eps: Small epsilon for numerical stability
+
+    Returns:
+        Tensor containing [cos(angle), sin(angle)]
+    """
     def th_norm(x, eps: float = 1e-8):
         return x.square().sum(-1, keepdim=True).add(eps).sqrt()
 
@@ -31,6 +67,20 @@ def th_ang_v(ab, bc, eps: float = 1e-8):
 
 
 def th_dih_v(ab, bc, cd):
+    """
+    Calculate dihedral angle from three vectors.
+
+    Computes the dihedral angle defined by four atoms (represented by
+    three bond vectors) and returns both cosine and sine components.
+
+    Args:
+        ab: Vector from atom 1 to atom 2
+        bc: Vector from atom 2 to atom 3
+        cd: Vector from atom 3 to atom 4
+
+    Returns:
+        Tensor containing [cos(dihedral), sin(dihedral)]
+    """
     def th_cross(a, b):
         a, b = torch.broadcast_tensors(a, b)
         return torch.cross(a, b, dim=-1)
@@ -51,12 +101,37 @@ def th_dih_v(ab, bc, cd):
 
 
 def th_dih(a, b, c, d):
+    """
+    Calculate dihedral angle from four atom positions.
+
+    Args:
+        a, b, c, d: Positions of four atoms defining the dihedral
+
+    Returns:
+        Tensor containing [cos(dihedral), sin(dihedral)]
+    """
     return th_dih_v(a - b, b - c, c - d)
 
 
-# More complicated version splits error in CA-N and CA-C (giving more accurate CB position)
-# It returns the rigid transformation from local frame to global frame
 def rigid_from_3_points(N, Ca, C, non_ideal=False, eps=1e-8):
+    """
+    Construct rigid transformation (rotation + translation) from 3 backbone atoms.
+
+    Builds a local coordinate frame from N, CA, C atoms. The more sophisticated
+    version (non_ideal=True) corrects for deviations from ideal bond angles,
+    giving more accurate CB positioning.
+
+    Args:
+        N: N atom coordinates [B, L, 3]
+        Ca: CA atom coordinates [B, L, 3]
+        C: C atom coordinates [B, L, 3]
+        non_ideal: Whether to correct for non-ideal bond angles
+        eps: Small epsilon for numerical stability
+
+    Returns:
+        R: Rotation matrix [B, L, 3, 3]
+        Ca: Translation (CA position) [B, L, 3]
+    """
     # N, Ca, C - [B,L, 3]
     # R - [B,L, 3, 3], det(R)=1, inv(R) = R.T, R is a rotation matrix
     B, L = N.shape[:2]
@@ -95,6 +170,21 @@ def rigid_from_3_points(N, Ca, C, non_ideal=False, eps=1e-8):
 
 
 def get_tor_mask(seq, torsion_indices, mask_in=None):
+    """
+    Generate mask indicating which torsion angles are valid for each residue.
+
+    Creates a boolean mask for backbone (omega, phi, psi) and sidechain (chi1-4)
+    torsions, plus additional geometric angles. Accounts for amino acid type
+    and missing atoms.
+
+    Args:
+        seq: Amino acid sequence as indices [B, L]
+        torsion_indices: Indices of atoms defining torsions [22, 4, 4]
+        mask_in: Optional mask for missing atoms [B, L, n_atoms]
+
+    Returns:
+        tors_mask: Boolean mask for valid torsions [B, L, 10]
+    """
     B, L = seq.shape[:2]
     tors_mask = torch.ones((B, L, 10), dtype=torch.bool, device=seq.device)
     tors_mask[..., 3:7] = torsion_indices[seq, :, -1] > 0
@@ -133,6 +223,27 @@ def get_tor_mask(seq, torsion_indices, mask_in=None):
 def get_torsions(
     xyz_in, seq, torsion_indices, torsion_can_flip, ref_angles, mask_in=None
 ):
+    """
+    Extract all torsion and bond angles from protein coordinates.
+
+    Computes omega, phi, psi, chi angles plus additional geometric descriptors
+    (CB bend/twist, CG bend). Handles symmetric sidechains by returning both
+    standard and alternate torsion representations.
+
+    Args:
+        xyz_in: Atomic coordinates [B, L, n_atoms, 3]
+        seq: Amino acid sequence [B, L]
+        torsion_indices: Indices defining torsion atoms
+        torsion_can_flip: Boolean mask for symmetric sidechains
+        ref_angles: Reference angles for geometric descriptors
+        mask_in: Optional mask for missing atoms
+
+    Returns:
+        torsions: Torsion angles [B, L, 10, 2] (cos, sin)
+        torsions_alt: Alternate torsions for symmetric sidechains
+        tors_mask: Boolean mask for valid torsions
+        tors_planar: Boolean mask for planar torsions (e.g., TYR chi3)
+    """
     B, L = xyz_in.shape[:2]
 
     tors_mask = get_tor_mask(seq, torsion_indices, mask_in)
@@ -223,6 +334,20 @@ def get_torsions(
 
 
 def get_tips(xyz, seq):
+    """
+    Extract tip atom coordinates for each residue.
+
+    Gets the furthest sidechain atom from the backbone for each residue.
+    For residues without sidechains (e.g., GLY), generates a virtual CB.
+
+    Args:
+        xyz: Atomic coordinates [B, L, n_atoms, 3]
+        seq: Amino acid sequence [B, L]
+
+    Returns:
+        xyz_tips: Tip atom coordinates [B, L, 3]
+        mask: Boolean mask indicating which tips are real atoms (vs virtual CB)
+    """
     B, L = xyz.shape[:2]
 
     xyz_tips = torch.gather(
@@ -245,8 +370,20 @@ def get_tips(xyz, seq):
     return xyz_tips, mask
 
 
-# process ideal frames
 def make_frame(X, Y):
+    """
+    Create an orthonormal coordinate frame from two vectors.
+
+    Constructs a right-handed orthonormal basis using Gram-Schmidt
+    orthogonalization. Used for defining local frames in protein geometry.
+
+    Args:
+        X: First direction vector
+        Y: Second direction vector (will be orthogonalized)
+
+    Returns:
+        Frame matrix with columns [Xn, Yn, Zn] where Zn = Xn × Yn
+    """
     Xn = X / torch.linalg.norm(X)
     Y = Y - torch.dot(Y, Xn) * Xn
     Yn = Y / torch.linalg.norm(Y)
@@ -257,6 +394,18 @@ def make_frame(X, Y):
 
 
 def cross_product_matrix(u):
+    """
+    Build the skew-symmetric cross product matrix for a vector.
+
+    For vector u = [u0, u1, u2], returns the matrix [u]× such that
+    [u]× v = u × v for any vector v.
+
+    Args:
+        u: Input vectors [B, L, 3]
+
+    Returns:
+        Cross product matrices [B, L, 3, 3]
+    """
     B, L = u.shape[:2]
     matrix = torch.zeros((B, L, 3, 3), device=u.device)
     matrix[:, :, 0, 1] = -u[..., 2]
@@ -268,10 +417,24 @@ def cross_product_matrix(u):
     return matrix
 
 
-# writepdb
 def writepdb(
     filename, atoms, seq, binderlen=None, idx_pdb=None, bfacts=None, chain_idx=None
 ):
+    """
+    Write protein structure to PDB format file.
+
+    Supports various atom representations (CA-only, backbone, all-atom).
+    Can handle multi-chain structures and custom B-factors.
+
+    Args:
+        filename: Output PDB filename
+        atoms: Atomic coordinates (can be [L,3], [L,3,3], [L,4,3], or [L,27,3])
+        seq: Amino acid sequence as indices
+        binderlen: Optional length of binder chain (for multi-chain structures)
+        idx_pdb: Optional custom residue numbering
+        bfacts: Optional B-factors [L]
+        chain_idx: Optional chain identifiers for each residue
+    """
     f = open(filename, "w")
     ctr = 1
     scpu = seq.cpu().squeeze()
@@ -414,14 +577,17 @@ def writepdb(
                     ctr += 1
 
 
-# resolve tip atom indices
+# Resolve tip atom indices for each amino acid type
+# Maps from aa2tip names to indices in aa2long
 tip_indices = torch.full((22,), 0)
 for i in range(22):
     tip_atm = aa2tip[i]
     atm_long = aa2long[i]
     tip_indices[i] = atm_long.index(tip_atm)
 
-# resolve torsion indices
+# Resolve torsion indices for each amino acid
+# Maps torsion atom names to indices in aa2long
+# Also identifies which torsions can flip (symmetric sidechains)
 torsion_indices = torch.full((22, 4, 4), 0)
 torsion_can_flip = torch.full((22, 10), False, dtype=torch.bool)
 for i in range(22):
@@ -434,10 +600,11 @@ for i in range(22):
             torsion_indices[i, j, k] = i_l.index(a)
             if i_l.index(a) != i_a.index(a):
                 torsion_can_flip[i, 3 + j] = True  ##bb tors never flip
-# HIS is a special case
+# HIS is a special case (chi2 doesn't flip due to imidazole ring)
 torsion_can_flip[8, 4] = False
 
-# build the mapping from atoms in the full rep (Nx27) to the "alternate" rep
+# Build mapping from full atom representation (Nx27) to alternate representation
+# Handles symmetric atom naming ambiguities
 allatom_mask = torch.zeros((22, 27), dtype=torch.bool)
 long2alt = torch.zeros((22, 27), dtype=torch.long)
 for i in range(22):
@@ -449,7 +616,9 @@ for i in range(22):
             long2alt[i, j] = i_lalt.index(a)
             allatom_mask[i, j] = True
 
-# bond graph traversal
+# Build bond graph for each amino acid using shortest path algorithm
+# num_bonds[i,j,k] = number of bonds between atom j and k in amino acid i
+# Capped at 4 bonds (used for clash detection and scoring)
 num_bonds = torch.zeros((22, 27, 27), dtype=torch.long)
 for i in range(22):
     num_bonds_i = np.zeros((27, 27))
@@ -461,8 +630,10 @@ for i in range(22):
     num_bonds[i, ...] = torch.tensor(num_bonds_i)
 
 
-# LJ/LK scoring parameters
+# Lennard-Jones and Lazaridis-Karplus solvation parameters
+# ljlk_parameters: [lj_radius, lj_wdepth, lk_dgfree, lk_lambda, lk_volume]
 ljlk_parameters = torch.zeros((22, 27, 5), dtype=torch.float)
+# Corrections for special atom types: [is_donor, is_acceptor, is_hpol, is_disulf]
 lj_correction_parameters = torch.zeros(
     (22, 27, 4), dtype=bool
 )  # donor/acceptor/hpol/disulf
@@ -480,8 +651,19 @@ for i in range(22):
             lj_correction_parameters[i, j, 3] = a == "SH1" or a == "HS"
 
 
-# hbond scoring parameters
+# Hydrogen bond scoring parameters and helper functions
 def donorHs(D, bonds, atoms):
+    """
+    Find hydrogen atoms bonded to a donor atom.
+
+    Args:
+        D: Donor atom name
+        bonds: List of bonded atom pairs
+        atoms: List of all atom names
+
+    Returns:
+        List of hydrogen atom indices bonded to the donor
+    """
     dHs = []
     for i, j in bonds:
         if i == D:
@@ -497,6 +679,23 @@ def donorHs(D, bonds, atoms):
 
 
 def acceptorBB0(A, hyb, bonds, atoms):
+    """
+    Find base and second-base atoms for a hydrogen bond acceptor.
+
+    For hydrogen bond geometry calculations, we need the acceptor (A),
+    the base atom (B) bonded to A, and a second atom (B0) to define
+    the acceptor plane.
+
+    Args:
+        A: Acceptor atom name
+        hyb: Hybridization type (SP2, SP3, or RING)
+        bonds: List of bonded atom pairs
+        atoms: List of all atom names
+
+    Returns:
+        B: Base atom index
+        B0: Second base atom index
+    """
     if hyb == HbHybType.SP2:
         for i, j in bonds:
             if i == A:
@@ -537,12 +736,17 @@ def acceptorBB0(A, hyb, bonds, atoms):
     return B, B0
 
 
+# Hydrogen bond type classification for each atom
+# [donor_type, acceptor_type, acceptor_hybridization]
 hbtypes = torch.full(
     (22, 27, 3), -1, dtype=torch.long
 )  # (donortype, acceptortype, acchybtype)
+# Base atoms for hydrogen bond geometry: (B, B0) for acceptors, (D, -1) for donors
 hbbaseatoms = torch.full(
     (22, 27, 2), -1, dtype=torch.long
 )  # (B,B0) for acc; (D,-1) for don
+# Polynomial coefficients for hydrogen bond scoring
+# [weight, xmin, xmax, ymin, ymax, c9, c8, ..., c0]
 hbpolys = torch.zeros(
     (HbDonType.NTYPES, HbAccType.NTYPES, 3, 15)
 )  # weight,xmin,xmax,ymin,ymax,c9,...,c0
@@ -584,11 +788,12 @@ for i in range(HbDonType.NTYPES):
         hbpolys[i, j, 2, 3:5] = torch.tensor(yrange)
         hbpolys[i, j, 2, 5:] = torch.tensor(coeffs)
 
-# kinematic parameters
+# Kinematic parameters for building atom coordinates from torsions
+# Maps each atom to its parent frame and local coordinates
 base_indices = torch.full((22, 27), 0, dtype=torch.long)
-xyzs_in_base_frame = torch.ones((22, 27, 4))
-RTs_by_torsion = torch.eye(4).repeat(22, 7, 1, 1)
-reference_angles = torch.ones((22, 3, 2))
+xyzs_in_base_frame = torch.ones((22, 27, 4))  # Homogeneous coordinates
+RTs_by_torsion = torch.eye(4).repeat(22, 7, 1, 1)  # Rigid transforms for each torsion
+reference_angles = torch.ones((22, 3, 2))  # Reference angles for CB/CG geometry
 
 for i in range(22):
     i_l = aa2long[i]
@@ -654,8 +859,9 @@ for i in range(22):
     reference_angles[i, 1, :] = th_ang_v(CBr - CAr, NCpp)
     reference_angles[i, 2, :] = th_ang_v(CGr, torch.tensor([-1.0, 0.0, 0.0]))
 
-N_BACKBONE_ATOMS = 3
-N_HEAVY = 14
+# Constants for atom indexing
+N_BACKBONE_ATOMS = 3  # N, CA, C
+N_HEAVY = 14  # Number of heavy atoms in full representation
 
 
 def writepdb_multi(
@@ -715,6 +921,21 @@ def writepdb_multi(
         f.write("ENDMDL\n")
 
 def calc_rmsd(xyz1, xyz2, eps=1e-6):
+    """
+    Calculate RMSD between two sets of coordinates after optimal superposition.
+
+    Uses SVD to find the optimal rotation that minimizes RMSD between
+    two coordinate sets.
+
+    Args:
+        xyz1: First coordinate set [L, 3]
+        xyz2: Second coordinate set [L, 3]
+        eps: Small epsilon for numerical stability
+
+    Returns:
+        rmsd: Root mean square deviation after optimal alignment
+        U: Optimal rotation matrix
+    """
     """
     Calculates RMSD between two sets of atoms (L, 3)
     """

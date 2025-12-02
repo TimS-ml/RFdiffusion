@@ -1,3 +1,12 @@
+"""
+Contig mapping for protein design and inpainting.
+
+This module handles the mapping between protein residues and their roles in design:
+- Scaffolding (inpainted/designed regions)
+- Receptor (fixed template regions)
+Supports multi-chain structures and flexible sequence/structure masking.
+"""
+
 import sys
 import numpy as np
 import random

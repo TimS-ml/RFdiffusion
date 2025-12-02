@@ -1,3 +1,14 @@
+"""
+Inference utilities for RFdiffusion structure generation.
+
+This module provides utility functions and classes for the inference process, including:
+- Denoising logic for reverse diffusion
+- Frame and coordinate updates
+- Noise scheduling
+- PDB parsing and processing
+- Block adjacency and secondary structure handling
+- Target processing for binder design
+"""
 import numpy as np
 import os
 from omegaconf import DictConfig
@@ -19,6 +30,25 @@ import glob
 
 
 def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=1.0):
+    """
+    Update backbone frames using IGSO(3) reverse diffusion.
+
+    Generates frames at timestep t-1 from current frames at t and predicted x0.
+    Rather than generating random rotations (as in forward diffusion), this calculates
+    the rotation between xt and px0 to guide the reverse process.
+
+    Args:
+        xt (torch.Tensor): Noised coordinates [L, 14, 3]
+        px0 (torch.Tensor): Predicted coordinates at t=0 [L, 14, 3]
+        t (int): Current timestep
+        diffuser: Diffuser object for reverse IGSO3 sampling
+        so3_type (str): Type of SO(3) noising ('igso3')
+        diffusion_mask (torch.Tensor): Boolean mask [L], True means fixed (not updated)
+        noise_scale (float): Scale factor for added noise (IGSO3 only)
+
+    Returns:
+        np.ndarray: Backbone coordinates for step t-1, shape [L, 3, 3]
+    """
     """
     get_next_frames gets updated frames using IGSO(3) + score_based reverse diffusion.
 
@@ -93,8 +123,20 @@ def get_next_frames(xt, px0, t, diffuser, so3_type, diffusion_mask, noise_scale=
 
 def get_mu_xt_x0(xt, px0, t, beta_schedule, alphabar_schedule, eps=1e-6):
     """
-    Given xt, predicted x0 and the timestep t, give mu of x(t-1)
-    Assumes t is 0 indexed
+    Calculate the mean (mu) for the distribution of x(t-1) given xt and x0.
+
+    This implements the reverse diffusion posterior mean from DDPM.
+
+    Args:
+        xt (torch.Tensor): Current coordinates [L, 14/27, 3]
+        px0 (torch.Tensor): Predicted x0 [L, 14/27, 3]
+        t (int): Current timestep (0-indexed)
+        beta_schedule (torch.Tensor): Beta values for each timestep
+        alphabar_schedule (torch.Tensor): Cumulative product of (1 - beta)
+        eps (float): Small constant for numerical stability
+
+    Returns:
+        tuple: (mu, sigma) where mu is the mean and sigma is the variance
     """
     # sigma is predefined from beta. Often referred to as beta tilde t
     t_idx = t - 1
@@ -133,24 +175,23 @@ def get_next_ca(
     noise_scale=1.0,
 ):
     """
-    Given full atom x0 prediction (xyz coordinates), diffuse to x(t-1)
+    Generate C-alpha positions at timestep t-1 via reverse diffusion.
 
-    Parameters:
+    Uses the predicted x0 to calculate the posterior mean and adds Gaussian noise
+    to sample coordinates at the previous timestep.
 
-        xt (L, 14/27, 3) set of coordinates
+    Args:
+        xt (torch.Tensor): Current coordinates [L, 14/27, 3]
+        px0 (torch.Tensor): Predicted x0 coordinates [L, 14/27, 3]
+        t (int): Current timestep (0-indexed, generating t-1)
+        diffusion_mask (torch.Tensor): Boolean [L], True means NOT diffused (fixed)
+        crd_scale (float): Coordinate scaling factor
+        beta_schedule (torch.Tensor): Beta schedule
+        alphabar_schedule (torch.Tensor): Alpha-bar schedule
+        noise_scale (float): Scale factor for added noise
 
-        px0 (L, 14/27, 3) set of coordinates
-
-        t: time step. Note this is zero-index current time step, so are generating t-1
-
-        logits_aa (L x 20 ) amino acid probabilities at each position
-
-        seq_schedule (L): Tensor of bools, True is unmasked, False is masked. For this specific t
-
-        diffusion_mask (torch.tensor, required): Tensor of bools, True means NOT diffused at this residue, False means diffused
-
-        noise_scale: scale factor for the noise being added
-
+    Returns:
+        tuple: (out_crds, delta) - updated coordinates and the displacement applied
     """
     get_allatom = ComputeAllAtomCoords().to(device=xt.device)
     L = len(xt)
@@ -178,22 +219,19 @@ def get_next_ca(
 
 def get_noise_schedule(T, noiseT, noise1, schedule_type):
     """
-    Function to create a schedule that varies the scale of noise given to the model over time
+    Create a schedule that varies noise scale over diffusion timesteps.
 
-    Parameters:
+    The noise schedule controls how much randomness is added at each reverse
+    diffusion step, allowing for annealing strategies.
 
-        T: The total number of timesteps in the denoising trajectory
-
-        noiseT: The inital (t=T) noise scale
-
-        noise1: The final (t=1) noise scale
-
-        schedule_type: The type of function to use to interpolate between noiseT and noise1
+    Args:
+        T (int): Total number of timesteps
+        noiseT (float): Initial (t=T) noise scale
+        noise1 (float): Final (t=1) noise scale
+        schedule_type (str): Type of interpolation ('constant' or 'linear')
 
     Returns:
-
-        noise_schedule: A function which maps timestep to noise scale
-
+        function: A function mapping timestep to noise scale
     """
 
     noise_schedules = {
@@ -210,12 +248,18 @@ def get_noise_schedule(T, noiseT, noise1, schedule_type):
 
 class Denoise:
     """
-    Class for getting x(t-1) from predicted x0 and x(t)
-    Strategy:
-        Ca coordinates: Rediffuse to x(t-1) from predicted x0
-        Frames: Approximate update from rotation score
-        Torsions: 1/t of the way to the x0 prediction
+    Denoising class for reverse diffusion sampling.
 
+    This class handles the generation of x(t-1) from the current state x(t) and
+    predicted x0. It implements the reverse diffusion process with:
+    - C-alpha coordinate updates via Gaussian diffusion
+    - Backbone frame updates via IGSO(3) rotation diffusion
+    - Gradient-based guidance from potential functions
+
+    The strategy combines multiple diffusion processes:
+    - Ca coordinates: Gaussian reverse diffusion to x(t-1) from predicted x0
+    - Frames: SO(3) rotation updates using rotation score approximation
+    - Optional: Gradient-based guidance from energy potentials
     """
 
     def __init__(
@@ -502,6 +546,15 @@ class Denoise:
 
 
 def sampler_selector(conf: DictConfig):
+    """
+    Select and instantiate the appropriate sampler based on configuration.
+
+    Args:
+        conf (DictConfig): Configuration specifying sampler type
+
+    Returns:
+        Sampler: An instance of the appropriate sampler class
+    """
     if conf.scaffoldguided.scaffoldguided:
         sampler = model_runners.ScaffoldedSampler(conf)
     else:
@@ -517,13 +570,40 @@ def sampler_selector(conf: DictConfig):
 
 
 def parse_pdb(filename, **kwargs):
-    """extract xyz coords for all heavy atoms"""
+    """
+    Extract xyz coordinates for all heavy atoms from a PDB file.
+
+    Args:
+        filename (str): Path to PDB file
+        **kwargs: Additional arguments passed to parse_pdb_lines
+
+    Returns:
+        dict: Parsed PDB data including coordinates, masks, sequence, indices
+    """
     with open(filename,"r") as f:
         lines=f.readlines()
     return parse_pdb_lines(lines, **kwargs)
 
 
 def parse_pdb_lines(lines, parse_hetatom=False, ignore_het_h=True):
+    """
+    Parse PDB file lines to extract atomic coordinates and metadata.
+
+    Args:
+        lines (list): Lines from a PDB file
+        parse_hetatom (bool): Whether to parse HETATM records (ligands, etc.)
+        ignore_het_h (bool): Whether to ignore hydrogen atoms in HETATMs
+
+    Returns:
+        dict: Dictionary containing:
+            - xyz: Atomic coordinates [L, 14, 3]
+            - mask: Atom presence mask [L, 14]
+            - idx: Residue numbers [L]
+            - seq: Amino acid sequence [L]
+            - pdb_idx: List of (chain, residue number) tuples
+            - xyz_het: Heteroatom coordinates (if parse_hetatom=True)
+            - info_het: Heteroatom metadata (if parse_hetatom=True)
+    """
     # indices of residues observed in the structure
     res, pdb_idx = [],[]
     for l in lines:
@@ -611,7 +691,19 @@ def parse_pdb_lines(lines, parse_hetatom=False, ignore_het_h=True):
 
 
 def process_target(pdb_path, parse_hetatom=False, center=True):
-    # Read target pdb and extract features.
+    """
+    Process a target PDB file for use in structure generation.
+
+    Reads PDB, extracts features, and optionally centers coordinates.
+
+    Args:
+        pdb_path (str): Path to target PDB file
+        parse_hetatom (bool): Whether to parse heteroatoms (ligands)
+        center (bool): Whether to zero-center the coordinates
+
+    Returns:
+        dict: Processed target features including 27-atom representation
+    """
     target_struct = parse_pdb(pdb_path, parse_hetatom=parse_hetatom)
 
     # Zero-center positions
@@ -643,7 +735,15 @@ def process_target(pdb_path, parse_hetatom=False, center=True):
 
 def get_idx0_hotspots(mappings, ppi_conf, binderlen):
     """
-    Take pdb-indexed hotspot resudes and the length of the binder, and makes the 0-indexed tensor of hotspots
+    Convert PDB-indexed hotspot residues to 0-indexed positions.
+
+    Args:
+        mappings (dict): Mapping between PDB and internal indexing
+        ppi_conf: PPI configuration containing hotspot residue definitions
+        binderlen (int): Length of the binder chain
+
+    Returns:
+        list or None: 0-indexed hotspot positions, or None if no binder
     """
 
     hotspot_idx = None
@@ -662,23 +762,27 @@ def get_idx0_hotspots(mappings, ppi_conf, binderlen):
 
 class BlockAdjacency:
     """
-    Class for handling PPI design inference with ss/block_adj inputs.
-    Basic idea is to provide a list of scaffolds, and to output ss and adjacency
-    matrices based off of these, while sampling additional lengths.
+    Handler for scaffold-guided design with secondary structure and block adjacency.
+
+    This class manages a library of protein scaffolds and samples from them to guide
+    structure generation. It can add loop insertions and terminal extensions to vary
+    the scaffold topology.
+
     Inputs:
-        - scaffold_list: list of scaffolds (e.g. ['2kl8','1cif']). Can also be a .txt file.
-        - scaffold dir: directory where scaffold ss and adj are precalculated
-        - sampled_insertion: how many additional residues do you want to add to each loop segment? Randomly sampled 0-this number (or within given range)
-        - sampled_N: randomly sample up to this number of additional residues at N-term
-        - sampled_C: randomly sample up to this number of additional residues at C-term
-        - ss_mask: how many residues do you want to mask at either end of a ss (H or E) block. Fixed value
-        - num_designs: how many designs are you wanting to generate? Currently only used for bookkeeping
-        - systematic: do you want to systematically work through the list of scaffolds, or randomly sample (default)
-        - num_designs_per_input: Not really implemented yet. Maybe not necessary
+        - scaffold_list: List of scaffold IDs or path to .txt file
+        - scaffold_dir: Directory with pre-computed SS and adjacency files
+        - sampled_insertion: Range for random loop insertions (0-N or min-max)
+        - sampled_N: Range for N-terminal extensions
+        - sampled_C: Range for C-terminal extensions
+        - ss_mask: Number of residues to mask at SS element boundaries
+        - num_designs: Total designs to generate (for bookkeeping)
+        - systematic: Whether to iterate systematically vs. random sampling
+        - mask_loops: Whether to mask loop regions
+
     Outputs:
-        - L: new length of chain to be diffused
-        - ss: all loops and insertions, and ends of ss blocks (up to ss_mask) set to mask token (3). Onehot encoded. (L,4)
-        - adj: block adjacency with equivalent masking as ss (L,L)
+        - L: Total length of chain to diffuse
+        - ss: Secondary structure [L, 4] one-hot (H/E/L/mask)
+        - adj: Block adjacency matrix [L, L] with masked regions
     """
 
     def __init__(self, conf, num_designs):
@@ -914,13 +1018,18 @@ class BlockAdjacency:
 
 class Target:
     """
-    Class to handle targets (fixed chains).
+    Handler for target structures (fixed chains) in binder design.
+
+    This class processes target PDB files, handles hotspot specification,
+    and supports cropping to specific regions via contig notation.
+
     Inputs:
-        - path to pdb file
-        - hotspot residues, in the form B10,B12,B60 etc
-        - whether or not to crop, and with which method
+        - target_path: Path to target PDB file
+        - hotspot_res: Hotspot residues (e.g., ['B10', 'B12', 'B60'])
+        - contig_crop: Contig string for cropping target regions
+
     Outputs:
-        - Dictionary of xyz coordinates, indices, pdb_indices, pdb mask
+        - Dictionary with xyz coordinates, indices, masks, and hotspot info
     """
 
     def __init__(self, conf: DictConfig, hotspots=None):
@@ -1003,8 +1112,14 @@ class Target:
         return self.pdb
 
 def ss_from_contig(ss_masks: dict):
-    """  
-    Function for taking 1D masks for each of the ss types, and outputting a secondary structure input
+    """
+    Convert per-residue secondary structure masks to one-hot encoded tensor.
+
+    Args:
+        ss_masks (dict): Dictionary with 'helix', 'strand', 'loop' boolean masks
+
+    Returns:
+        torch.Tensor: One-hot encoded SS [L, 4] where channels are H/E/L/mask
     """
     L=len(ss_masks['helix'])
     ss=torch.zeros((L, 4)).long()

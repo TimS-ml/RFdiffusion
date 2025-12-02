@@ -1,4 +1,11 @@
-"""Helper class for handle symmetric assemblies."""
+"""
+Symmetry handling for generating symmetric protein assemblies.
+
+This module provides classes and functions for applying various types of molecular
+symmetry (cyclic, dihedral, tetrahedral, octahedral, icosahedral) to protein
+structures during generation. It handles coordinate transformations and chain
+indexing for symmetric oligomers.
+"""
 from pyrsistent import v
 from scipy.spatial.transform import Rotation
 import functools as fn
@@ -32,8 +39,24 @@ T3_ROTATIONS = [
 saved_symmetries = ['tetrahedral', 'octahedral', 'icosahedral']
 
 class SymGen:
+    """
+    Symmetry generator for creating symmetric protein assemblies.
+
+    This class handles the application of molecular symmetry operations to generate
+    symmetric oligomers. Supports various point group symmetries including cyclic (Cn),
+    dihedral (Dn), tetrahedral, octahedral, and icosahedral symmetries.
+    """
 
     def __init__(self, global_sym, recenter, radius, model_only_neighbors=False):
+        """
+        Initialize symmetry generator.
+
+        Args:
+            global_sym (str): Symmetry type (e.g., 'C3', 'D2', 'octahedral')
+            recenter (bool): Whether to recenter subunits after symmetry application
+            radius (float): Radius for positioning subunits in certain symmetries
+            model_only_neighbors (bool): Whether to model only neighboring subunits
+        """
         self._log = logging.getLogger(__name__)
         self._recenter = recenter
         self._radius = radius
@@ -89,6 +112,15 @@ class SymGen:
     ## Cyclic symmetry ##
     #####################
     def _init_cyclic(self, order):
+        """
+        Initialize cyclic (Cn) symmetry.
+
+        Creates rotation matrices for Cn symmetry by rotating around the z-axis
+        by multiples of 360/n degrees.
+
+        Args:
+            order (int): Order of cyclic symmetry (n in Cn)
+        """
         sym_rots = []
         for i in range(order):
             deg = i * 360.0 / order
@@ -98,6 +130,16 @@ class SymGen:
         self.order = order
 
     def _apply_cyclic(self, coords_in, seq_in):
+        """
+        Apply cyclic symmetry to coordinates and sequence.
+
+        Args:
+            coords_in (torch.Tensor): Input coordinates [L, n_atoms, 3]
+            seq_in (torch.Tensor): Input sequence [L, ...]
+
+        Returns:
+            tuple: (coords_out, seq_out) - Symmetrized coordinates and sequence
+        """
         coords_out = torch.clone(coords_in)
         seq_out = torch.clone(seq_in)
         if seq_out.shape[0] % self.order != 0:
@@ -113,6 +155,20 @@ class SymGen:
         return coords_out, seq_out
 
     def _lin_chainbreaks(self, num_breaks, res_idx, offset=None):
+        """
+        Insert linear chain breaks for symmetric copies.
+
+        Assigns different chain IDs and offsets residue indices for each
+        symmetric subunit to distinguish them.
+
+        Args:
+            num_breaks (int): Number of chain breaks (= number of subunits)
+            res_idx (torch.Tensor): Residue indices [B, L]
+            offset (int, optional): Offset to add between chains
+
+        Returns:
+            tuple: (res_idx, chain_delimiters) - Updated indices and chain IDs
+        """
         assert res_idx.ndim == 2
         res_idx = torch.clone(res_idx)
         subunit_len = res_idx.shape[-1] // num_breaks
@@ -134,6 +190,15 @@ class SymGen:
     ## Dihedral symmetry ##
     #######################
     def _init_dihedral(self, order):
+        """
+        Initialize dihedral (Dn) symmetry.
+
+        Creates rotation matrices for Dn symmetry by combining z-axis rotations
+        with a 180-degree flip around the x-axis.
+
+        Args:
+            order (int): Order of dihedral symmetry (n in Dn, total 2n subunits)
+        """
         sym_rots = []
         flip = Rotation.from_euler('x', 180, degrees=True).as_matrix()
         for i in range(order):
@@ -149,6 +214,12 @@ class SymGen:
     ## Octahedral symmetry ##
     #########################
     def _init_octahedral(self):
+        """
+        Initialize octahedral symmetry.
+
+        Loads pre-computed rotation matrices for octahedral point group symmetry
+        from a saved file.
+        """
         sym_rots = np.load(f"{pathlib.Path(__file__).parent.resolve()}/sym_rots.npz")
         self.sym_rots = [
             torch.tensor(v_i, dtype=torch.float32)
@@ -157,6 +228,19 @@ class SymGen:
         self.order = len(self.sym_rots)
 
     def _apply_octahedral(self, coords_in, seq_in):
+        """
+        Apply octahedral symmetry to coordinates and sequence.
+
+        Applies rotation matrices and optionally recenters each subunit
+        at a specified radius from the origin.
+
+        Args:
+            coords_in (torch.Tensor): Input coordinates [L, n_atoms, 3]
+            seq_in (torch.Tensor): Input sequence [L, ...]
+
+        Returns:
+            tuple: (coords_out, seq_out) - Symmetrized coordinates and sequence
+        """
         coords_out = torch.clone(coords_in)
         seq_out = torch.clone(seq_in)
         if seq_out.shape[0] % self.order != 0:
@@ -185,13 +269,18 @@ class SymGen:
     ## symmetry from file #
     #######################
     def _init_from_symrots_file(self, name):
-        """ _init_from_symrots_file initializes using 
-        ./inference/sym_rots.npz
+        """
+        Initialize symmetry from pre-computed rotation matrices.
+
+        Loads rotation matrices from ./inference/sym_rots.npz for complex
+        symmetry types (tetrahedral, octahedral, icosahedral).
 
         Args:
-            name: name of symmetry (of tetrahedral, octahedral, icosahedral)
+            name (str): Symmetry name ('tetrahedral', 'octahedral', 'icosahedral')
 
-        sets self.sym_rots to be a list of torch.tensor of shape [3, 3]
+        Sets:
+            self.sym_rots: List of rotation matrices [3, 3]
+            self.order: Number of symmetry operations
         """
         assert name in saved_symmetries, name + " not in " + str(saved_symmetries)
 
@@ -219,11 +308,15 @@ class SymGen:
             assert np.isclose(((self.sym_rots[0]-np.eye(3))**2).sum(), 0)
 
     def close_neighbors(self):
-        """close_neighbors finds the rotations within self.sym_rots that
-        correspond to close neighbors.
+        """
+        Find rotation matrices corresponding to close neighbor subunits.
+
+        Identifies which symmetry operations produce subunits that are close
+        neighbors in the symmetric assembly by finding rotations with small
+        rotation angles.
 
         Returns:
-            list of rotation matrices corresponding to the identity and close neighbors
+            list: Rotation matrices for identity and close neighboring operations
         """
         # set of small rotation angle rotations
         rel_rot = lambda M: np.linalg.norm(Rotation.from_matrix(M).as_rotvec())

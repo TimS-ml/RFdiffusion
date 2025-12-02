@@ -1,3 +1,10 @@
+"""
+Debugging utility for logging function inputs to disk.
+
+This module provides decorators to pickle function arguments for debugging purposes.
+Useful for capturing model inputs to reproduce issues or analyze behavior.
+"""
+
 import traceback
 import os
 from inspect import signature
@@ -5,6 +12,19 @@ import pickle
 import datetime
 
 def pickle_function_call_wrapper(func, output_dir='pickled_inputs'):
+    """
+    Create a wrapper that pickles function arguments before calling the function.
+
+    This wrapper saves all function arguments to disk as pickle files,
+    along with the call stack for debugging.
+
+    Args:
+        func: Function to wrap
+        output_dir: Directory to save pickled arguments
+
+    Returns:
+        Wrapped function that logs inputs before execution
+    """
     i = 0
     os.makedirs(output_dir)
             # pickle.dump({'args': args, 'kwargs': kwargs}, fh)
@@ -38,6 +58,15 @@ def pickle_function_call_wrapper(func, output_dir='pickled_inputs'):
     return wrapper
 
 def wrap_it(wrapper, instance, method, **kwargs):
+    """
+    Apply a wrapper to a method of an object instance.
+
+    Args:
+        wrapper: Wrapper function to apply
+        instance: Object instance
+        method: Name of the method to wrap
+        **kwargs: Additional arguments passed to the wrapper
+    """
     class_method = getattr(instance, method)
     wrapped_method = wrapper(class_method, **kwargs)
     setattr(instance, method, wrapped_method)
@@ -45,11 +74,25 @@ def wrap_it(wrapper, instance, method, **kwargs):
 
 
 def pickle_function_call(instance, method, subdir):
-	output_dir = os.path.join(os.getcwd(), 'pickled_inputs', subdir, datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
-	wrap_it(pickle_function_call_wrapper, instance, method, output_dir=output_dir)
-	return output_dir
+    """
+    Wrap a method to pickle its arguments with timestamped output directory.
 
-# For testing
+    Creates a timestamped directory and wraps the specified method to save
+    all its arguments for debugging.
+
+    Args:
+        instance: Object instance containing the method
+        method: Name of the method to wrap
+        subdir: Subdirectory name for organizing pickled outputs
+
+    Returns:
+        output_dir: Path to the output directory where arguments are saved
+    """
+    output_dir = os.path.join(os.getcwd(), 'pickled_inputs', subdir, datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S"))
+    wrap_it(pickle_function_call_wrapper, instance, method, output_dir=output_dir)
+    return output_dir
+
+# Test code demonstrating usage
 if __name__=='__main__':
 	import glob
 	class Dog:

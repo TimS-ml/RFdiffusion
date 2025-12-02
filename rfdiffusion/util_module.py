@@ -1,3 +1,10 @@
+"""
+Neural network utility modules and helper functions for RFdiffusion.
+
+This module provides various utility functions and classes used in the neural
+network architecture, including initialization, dropout, and geometric functions.
+"""
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -9,12 +16,37 @@ from rfdiffusion.util import base_indices, RTs_by_torsion, xyzs_in_base_frame, r
 
 
 def find_breaks(ix, thresh=35):
+    """
+    Find chain breaks in residue index sequences.
+
+    Identifies positions where the residue index jump exceeds a threshold,
+    indicating chain breaks or discontinuities in the structure.
+
+    Args:
+        ix: Array of residue indices
+        thresh: Threshold for detecting breaks (default: 35)
+
+    Returns:
+        Array of indices where breaks occur
+    """
     # finds positions in ix where the jump is greater than 100
     breaks = np.where(np.diff(ix) > thresh)[0]
     return np.array(breaks)+1
 
 
 def init_lecun_normal(module):
+    """
+    Initialize module weights using truncated LeCun normal distribution.
+
+    LeCun initialization helps with training deep networks by maintaining
+    variance across layers. The truncation prevents extreme values.
+
+    Args:
+        module: PyTorch module to initialize
+
+    Returns:
+        Module with initialized weights
+    """
     def truncated_normal(uniform, mu=0.0, sigma=1.0, a=-2, b=2):
         normal = torch.distributions.normal.Normal(0, 1)
 
@@ -38,6 +70,17 @@ def init_lecun_normal(module):
     return module
 
 def init_lecun_normal_param(weight):
+    """
+    Initialize a parameter tensor using truncated LeCun normal distribution.
+
+    Similar to init_lecun_normal but works directly on parameter tensors.
+
+    Args:
+        weight: Weight parameter to initialize
+
+    Returns:
+        Initialized parameter
+    """
     def truncated_normal(uniform, mu=0.0, sigma=1.0, a=-2, b=2):
         normal = torch.distributions.normal.Normal(0, 1)
 
@@ -60,20 +103,56 @@ def init_lecun_normal_param(weight):
     weight = torch.nn.Parameter( (sample_truncated_normal(weight.shape)) )
     return weight
 
-# for gradient checkpointing
 def create_custom_forward(module, **kwargs):
+    """
+    Create a custom forward function for gradient checkpointing.
+
+    Gradient checkpointing trades compute for memory by recomputing
+    activations during the backward pass instead of storing them.
+
+    Args:
+        module: Module to create forward function for
+        **kwargs: Additional keyword arguments to pass to the module
+
+    Returns:
+        Custom forward function
+    """
     def custom_forward(*inputs):
         return module(*inputs, **kwargs)
     return custom_forward
 
 def get_clones(module, N):
+    """
+    Create N deep copies of a module.
+
+    Used to create multiple identical layers (e.g., in transformers).
+
+    Args:
+        module: Module to clone
+        N: Number of clones to create
+
+    Returns:
+        ModuleList containing N clones
+    """
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
 class Dropout(nn.Module):
-    # Dropout entire row or column
+    """
+    Dropout module that can broadcast along specific dimensions.
+
+    Unlike standard dropout, this can drop entire rows or columns,
+    useful for structured data like attention maps.
+    """
     def __init__(self, broadcast_dim=None, p_drop=0.15):
+        """
+        Initialize dropout module.
+
+        Args:
+            broadcast_dim: Dimension to broadcast dropout mask (None for standard dropout)
+            p_drop: Dropout probability (default: 0.15)
+        """
         super(Dropout, self).__init__()
-        # give ones with probability of 1-p_drop / zeros with p_drop
+        # Bernoulli sampler: ones with probability (1-p_drop), zeros with p_drop
         self.sampler = torch.distributions.bernoulli.Bernoulli(torch.tensor([1-p_drop]))
         self.broadcast_dim=broadcast_dim
         self.p_drop=p_drop
@@ -89,6 +168,18 @@ class Dropout(nn.Module):
         return x
 
 def rbf(D):
+    """
+    Apply radial basis function (RBF) encoding to distances.
+
+    Converts scalar distances into a feature vector using Gaussian RBFs.
+    This provides a differentiable way to represent distances for neural networks.
+
+    Args:
+        D: Distance tensor
+
+    Returns:
+        RBF-encoded distance features [*, D_count] where D_count=36
+    """
     # Distance radial basis function
     D_min, D_max, D_count = 0., 20., 36
     D_mu = torch.linspace(D_min, D_max, D_count).to(D.device)

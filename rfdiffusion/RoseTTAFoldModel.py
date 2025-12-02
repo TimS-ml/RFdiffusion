@@ -1,3 +1,10 @@
+"""
+RoseTTAFold model architecture for protein structure prediction.
+
+This module implements the RoseTTAFold neural network, which predicts protein structure
+from sequence and template information. The model uses multiple sequence alignments (MSAs),
+pairwise features, and structural templates to iteratively refine structure predictions.
+"""
 import torch
 import torch.nn as nn
 from rfdiffusion.Embeddings import MSA_emb, Extra_emb, Templ_emb, Recycling
@@ -6,9 +13,16 @@ from rfdiffusion.AuxiliaryPredictor import DistanceNetwork, MaskedTokenNetwork, 
 from opt_einsum import contract as einsum
 
 class RoseTTAFoldModule(nn.Module):
-    def __init__(self, 
-                 n_extra_block, 
-                 n_main_block, 
+    """
+    RoseTTAFold neural network module for protein structure prediction.
+
+    This module combines MSA processing, template embedding, and iterative structure
+    refinement to predict protein structures. It outputs distance/orientation predictions,
+    amino acid predictions, and confidence estimates (pLDDT).
+    """
+    def __init__(self,
+                 n_extra_block,
+                 n_main_block,
                  n_ref_block,
                  d_msa,
                  d_msa_full,
@@ -29,6 +43,32 @@ class RoseTTAFoldModule(nn.Module):
                  SE3_param_topk={'l0_in_features':32, 'l0_out_features':16, 'num_edge_features':32},
                  input_seq_onehot=False,     # For continuous vs. discrete sequence
                  ):
+        """
+        Initialize the RoseTTAFold module.
+
+        Args:
+            n_extra_block (int): Number of extra MSA processing blocks
+            n_main_block (int): Number of main processing blocks
+            n_ref_block (int): Number of refinement blocks
+            d_msa (int): Dimensionality of latent MSA embeddings
+            d_msa_full (int): Dimensionality of full MSA embeddings
+            d_pair (int): Dimensionality of pairwise residue features
+            d_templ (int): Dimensionality of template features
+            n_head_msa (int): Number of attention heads for MSA
+            n_head_pair (int): Number of attention heads for pair features
+            n_head_templ (int): Number of attention heads for templates
+            d_hidden (int): Hidden layer dimensionality
+            d_hidden_templ (int): Hidden layer dimensionality for templates
+            p_drop (float): Dropout probability
+            d_t1d (int): Dimensionality of 1D template features
+            d_t2d (int): Dimensionality of 2D template features
+            T (int): Total timesteps for diffusion
+            use_motif_timestep (bool): Whether to use distinct embedding for motif residues
+            freeze_track_motif (bool): Whether to freeze motif updates in structure refinement
+            SE3_param_full (dict): Parameters for SE(3) equivariant network (full)
+            SE3_param_topk (dict): Parameters for SE(3) equivariant network (top-k)
+            input_seq_onehot (bool): Whether input sequence is one-hot encoded
+        """
 
         super(RoseTTAFoldModule, self).__init__()
 
@@ -71,6 +111,38 @@ class RoseTTAFoldModule(nn.Module):
                 return_raw=False, return_full=False, return_infer=False,
                 use_checkpoint=False, motif_mask=None, i_cycle=None, n_cycle=None,
                 cyclic_reses=None):
+        """
+        Forward pass through the RoseTTAFold model.
+
+        Args:
+            msa_latent (torch.Tensor): Latent MSA features [B, N, L, d_msa]
+            msa_full (torch.Tensor): Full MSA features [B, N_full, L, d_msa_full]
+            seq (torch.Tensor): Sequence features [B, L, ...]
+            xyz (torch.Tensor): Input coordinates [B, L, n_atoms, 3]
+            idx (torch.Tensor): Residue indices [B, L]
+            t (torch.Tensor): Timestep
+            t1d (torch.Tensor, optional): 1D template features
+            t2d (torch.Tensor, optional): 2D template features
+            xyz_t (torch.Tensor, optional): Template coordinates
+            alpha_t (torch.Tensor, optional): Template torsion angles
+            msa_prev (torch.Tensor, optional): Previous MSA state for recycling
+            pair_prev (torch.Tensor, optional): Previous pair features for recycling
+            state_prev (torch.Tensor, optional): Previous state for recycling
+            return_raw (bool): Return raw predictions without auxiliary outputs
+            return_full (bool): Return full outputs
+            return_infer (bool): Return inference-specific outputs
+            use_checkpoint (bool): Use gradient checkpointing to save memory
+            motif_mask (torch.Tensor, optional): Mask for motif residues
+            i_cycle (int, optional): Current recycling cycle
+            n_cycle (int, optional): Total number of recycling cycles
+            cyclic_reses (torch.Tensor, optional): Mask for cyclic peptide residues
+
+        Returns:
+            Depending on return flags:
+            - return_raw: (msa, pair, xyz, state, alpha)
+            - return_infer: (msa, pair, xyz, state, alpha, logits_aa, pred_lddt)
+            - default: (logits, logits_aa, logits_exp, xyz, alpha_s, lddt)
+        """
 
         B, N, L = msa_latent.shape[:3]
         # Get embeddings

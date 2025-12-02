@@ -1,3 +1,10 @@
+"""
+Model inference runners for RFdiffusion protein structure generation.
+
+This module provides classes for running inference with RFdiffusion models, handling
+the complete sampling process from initialization to final structure generation. It includes
+samplers for unconditional generation, self-conditioning, and scaffold-guided design.
+"""
 import torch
 import numpy as np
 from omegaconf import DictConfig, OmegaConf
@@ -27,12 +34,21 @@ REF_ANGLES = util.reference_angles
 
 
 class Sampler:
+    """
+    Base sampler class for RFdiffusion inference.
+
+    This class handles model initialization, checkpoint loading, configuration assembly,
+    and the core sampling loop for generating protein structures via diffusion. It supports
+    features like partial diffusion, motif scaffolding, and symmetry constraints.
+    """
 
     def __init__(self, conf: DictConfig):
         """
         Initialize sampler.
+
         Args:
-            conf: Configuration.
+            conf (DictConfig): Hydra configuration containing model, inference, and
+                              diffusion parameters.
         """
         self.initialized = False
         self.initialize(conf)
@@ -291,14 +307,21 @@ class Sampler:
 
     def sample_init(self, return_forward_trajectory=False):
         """
-        Initial features to start the sampling process.
+        Initialize features to start the sampling process.
 
-        Modify signature and function body for different initialization
-        based on the config.
+        This method sets up the initial state for diffusion sampling, including:
+        - Parsing the input PDB and generating contig maps
+        - Initializing coordinates and sequence
+        - Setting up potentials and hotspots
+        - Applying symmetry if specified
+        - Performing forward diffusion to timestep T
+
+        Args:
+            return_forward_trajectory (bool): Whether to return the full forward trajectory
 
         Returns:
-            xt: Starting positions with a portion of them randomly sampled.
-            seq_t: Starting sequence with a portion of them set to unknown.
+            xt (torch.Tensor): Starting positions [L, 14, 3] with portions randomly noised
+            seq_t (torch.Tensor): Starting sequence [L, 22] with portions masked
         """
 
         #######################
@@ -565,27 +588,28 @@ class Sampler:
 
     def _preprocess(self, seq, xyz_t, t, repack=False):
         """
-        Function to prepare inputs to diffusion model
+        Prepare inputs for the diffusion model forward pass.
 
-            seq (L,22) one-hot sequence
+        This function converts raw sequence and coordinate data into the properly
+        formatted input tensors required by the RoseTTAFold model.
 
-            msa_masked (1,1,L,48)
+        Args:
+            seq (torch.Tensor): One-hot sequence [L, 22]
+            xyz_t (torch.Tensor): Template/diffused coordinates [L, 14, 3]
+            t (int): Current timestep
+            repack (bool): Whether this is a repacking step
 
-            msa_full (1,1,L,25)
-
-            xyz_t (L,14,3) template crds (diffused)
-
-            t1d (1,L,28) this is the t1d before tacking on the chi angles:
-                - seq + unknown/mask (21)
-                - global timestep (1-t/T if not motif else 1) (1)
-
-                MODEL SPECIFIC:
-                - contacting residues: for ppi. Target residues in contact with binder (1)
-                - empty feature (legacy) (1)
-                - ss (H, E, L, MASK) (4)
-
-            t2d (1, L, L, 45)
-                - last plane is block adjacency
+        Returns:
+            tuple: (msa_masked, msa_full, seq, xyz_t, idx, t1d, t2d, xyz_t, alpha_t)
+                - msa_masked [1, 1, L, 48]: Masked MSA features
+                - msa_full [1, 1, L, 25]: Full MSA features
+                - seq [1, L, 22]: Sequence one-hot
+                - xyz_t [1, 1, L, 27, 3]: Coordinates with NaN padding
+                - idx [1, L]: Residue indices
+                - t1d [1, 1, L, d_t1d]: 1D features (seq + timestep + model-specific)
+                - t2d [1, 1, L, L, d_t2d]: 2D features (distances + orientations)
+                - xyz_t: Template coordinates
+                - alpha_t [1, 1, L, 30]: Torsion angle features
         """
 
         L = seq.shape[0]
@@ -796,8 +820,13 @@ class Sampler:
 
 class SelfConditioning(Sampler):
     """
-    Model Runner for self conditioning
-    pX0[t+1] is provided as a template input to the model at time t
+    Sampler with self-conditioning for improved structure generation.
+
+    Self-conditioning feeds the model's prediction of x0 from the previous timestep
+    as an additional template input at the current timestep. This provides the model
+    with context about its own predictions and generally improves sample quality.
+
+    The prediction pX0[t+1] is provided as a template input to the model at time t.
     """
 
     def sample_step(self, *, t, x_t, seq_init, final_step):
@@ -917,19 +946,34 @@ class SelfConditioning(Sampler):
 
 class ScaffoldedSampler(SelfConditioning):
     """
-    Model Runner for Scaffold-Constrained diffusion
+    Sampler for scaffold-guided protein structure generation.
+
+    This sampler enables generation of proteins with specific secondary structure
+    and topology constraints. It supports two main modes:
+
+    1. Fold-guided generation: Provide secondary structure (helix/strand/loop) and
+       block adjacency patterns to generate proteins with specific folds
+    2. Mixed scaffolding: Combine motif scaffolding with fold constraints
+
+    The secondary structure and adjacency information guide the diffusion process
+    to produce structures matching the desired topology.
     """
 
     def __init__(self, conf: DictConfig):
         """
         Initialize scaffolded sampler.
-        Two basic approaches here:
-            i) Given a block adjacency/secondary structure input, generate a fold (in the presence or absence of a target)
-                - This allows easy generation of binders or specific folds
-                - Allows simple expansion of an input, to sample different lengths
-            ii) Providing a contig input and corresponding block adjacency/secondary structure input
-                - This allows mixed motif scaffolding and fold-conditioning.
-                - Adjacency/secondary structure inputs must correspond exactly in length to the contig string
+
+        Two basic approaches:
+            i) Block adjacency/secondary structure input to generate a specific fold
+               - Generates binders or specific folds with or without a target
+               - Allows sampling of different lengths via insertions
+            ii) Contig input with corresponding block adjacency/secondary structure
+               - Enables mixed motif scaffolding and fold-conditioning
+               - Adjacency/SS inputs must match contig length exactly
+
+        Args:
+            conf (DictConfig): Configuration with scaffolding parameters including
+                              scaffold_dir, secondary structure specs, and topology
         """
         super().__init__(conf)
         # initialize BlockAdjacency sampling class

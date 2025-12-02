@@ -1,4 +1,14 @@
-# script for diffusion protocols
+"""
+Diffusion protocols for protein structure generation.
+
+This module implements diffusion processes for protein generation, including:
+- Euclidean diffusion for C-alpha coordinates (translation in 3D space)
+- SO(3) diffusion for backbone frames (rotation in 3D space)
+- Combined diffusion process that handles both translation and rotation
+
+The diffusion process gradually adds noise to protein structures during training,
+and the reverse process is used to generate new protein structures from noise.
+"""
 import torch
 import pickle
 import numpy as np
@@ -19,7 +29,24 @@ torch.set_printoptions(sci_mode=False)
 
 def get_beta_schedule(T, b0, bT, schedule_type, schedule_params={}, inference=False):
     """
-    Given a noise schedule type, create the beta schedule
+    Create a beta noise schedule for the diffusion process.
+
+    Beta controls the amount of noise added at each timestep. This function creates
+    a schedule that gradually increases noise from b0 to bT over T timesteps.
+
+    Args:
+        T (int): Total number of diffusion timesteps
+        b0 (float): Initial beta value (noise level at t=1)
+        bT (float): Final beta value (noise level at t=T)
+        schedule_type (str): Type of schedule, currently only "linear" is supported
+        schedule_params (dict, optional): Additional parameters for the schedule
+        inference (bool, optional): If True, prints schedule information
+
+    Returns:
+        tuple: (beta_schedule, alpha_schedule, alphabar_schedule)
+            - beta_schedule: noise schedule (T,)
+            - alpha_schedule: 1 - beta (T,)
+            - alphabar_schedule: cumulative product of alphas (T,)
     """
     assert schedule_type in ["linear"]
 
@@ -49,7 +76,19 @@ def get_beta_schedule(T, b0, bT, schedule_type, schedule_params={}, inference=Fa
 
 
 class EuclideanDiffuser:
-    # class for diffusing points in 3D
+    """
+    Handles Euclidean diffusion of 3D points (protein C-alpha coordinates).
+
+    This class implements a diffusion process that adds Gaussian noise to 3D coordinates
+    of protein backbone C-alpha atoms. The noise is added according to a predefined
+    beta schedule that controls the variance at each timestep.
+
+    Attributes:
+        T (int): Total number of diffusion timesteps
+        beta_schedule (torch.Tensor): Variance schedule for noise addition
+        alpha_schedule (torch.Tensor): 1 - beta_schedule
+        alphabar_schedule (torch.Tensor): Cumulative product of alpha_schedule
+    """
 
     def __init__(
         self,
@@ -73,14 +112,23 @@ class EuclideanDiffuser:
 
     def apply_kernel(self, x, t, diffusion_mask=None, var_scale=1):
         """
-        Applies a noising kernel to the points in x
+        Apply Gaussian noise to 3D coordinates at a specific timestep.
 
-        Parameters:
-            x (torch.tensor, required): (N,3,3) set of backbone coordinates
+        Adds noise to C-alpha coordinates according to the beta schedule. The noise
+        is sampled from N(sqrt(1-beta_t) * x, beta_t * var_scale * I).
 
-            t (int, required): Which timestep
+        Args:
+            x (torch.Tensor): Backbone coordinates of shape (N, 3, 3) where N is the
+                number of residues and dimensions are (N, CA, C) atoms
+            t (int): Timestep index (1-indexed, from 1 to T)
+            diffusion_mask (torch.Tensor, optional): Boolean mask of shape (N,) where
+                True means do NOT diffuse this residue
+            var_scale (float, optional): Scale factor for variance. Default is 1
 
-            noise_scale (float, required): scale for noise
+        Returns:
+            tuple: (noised_coords, delta)
+                - noised_coords: Coordinates after adding noise (N, 3, 3)
+                - delta: The noise that was added (N, 3)
         """
         t_idx = t - 1  # bring from 1-indexed to 0-indexed
 
@@ -108,7 +156,20 @@ class EuclideanDiffuser:
 
     def apply_kernel_recursive(self, xyz, diffusion_mask=None, var_scale=1):
         """
-        Repeatedly apply self.apply_kernel T times and return all crds
+        Apply diffusion kernel recursively for all T timesteps.
+
+        Sequentially applies the diffusion kernel from t=1 to t=T, accumulating
+        noise at each step. Returns all intermediate noised coordinates.
+
+        Args:
+            xyz (torch.Tensor): Initial backbone coordinates (N, 3, 3)
+            diffusion_mask (torch.Tensor, optional): Mask for residues to skip (N,)
+            var_scale (float, optional): Variance scaling factor
+
+        Returns:
+            tuple: (bb_stack, T_stack)
+                - bb_stack: All noised coordinates (N, T, 3, 3)
+                - T_stack: All noise deltas (N, T, 3)
         """
         bb_stack = []
         T_stack = []
@@ -146,11 +207,29 @@ def read_pkl(read_path: str, verbose=False):
 
 class IGSO3:
     """
-    Class for taking in a set of backbone crds and performing IGSO3 diffusion
-    on all of them.
+    Isotropic Gaussian SO(3) diffusion for protein backbone orientations.
 
-    Unlike the diffusion on translations, much of this class is written for a
-    scaling between an initial time t=0 and final time t=1.
+    This class implements IGSO3 diffusion, which is a diffusion process on the
+    SO(3) manifold (3D rotation group). It is used to add noise to the orientations
+    of protein backbone frames during the forward diffusion process, and to denoise
+    them during generation.
+
+    The IGSO3 distribution is the isotropic Gaussian distribution on SO(3), which
+    represents rotations with a preferred axis of rotation but uniform distribution
+    around that axis. This is analogous to Brownian motion on the rotation manifold.
+
+    Unlike Euclidean diffusion, time is parameterized continuously from t=0 to t=1,
+    and then discretized into T steps for practical implementation.
+
+    Attributes:
+        T (int): Number of discrete timesteps
+        schedule (str): Noise schedule type ('linear' or 'exponential')
+        min_sigma (float): Minimum scale parameter for stability (typically 0.05)
+        max_sigma (float): Maximum scale parameter
+        min_b, max_b (float): Beta parameters for linear schedule
+        num_omega (int): Discretization level for angles in [0, pi]
+        L (int): Truncation level for power series expansion
+        igso3_vals (dict): Pre-computed IGSO3 values (pdf, cdf, score norms)
     """
 
     def __init__(
@@ -264,10 +343,20 @@ class IGSO3:
 
     def sigma(self, t: torch.tensor):
         """
-        Extract \sigma(t) corresponding to chosen sigma schedule.
+        Compute the scale parameter sigma(t) for the IGSO3 distribution.
+
+        Sigma controls the amount of rotational noise at time t. For the linear
+        schedule (recommended), sigma(t) = min_sigma + t*min_b + (t^2/2)*(max_b - min_b),
+        which follows a variance-exploding schedule analogous to Ho et al.'s DDPM.
 
         Args:
-            t: torch tensor with time between 0 and 1
+            t (torch.Tensor or float): Time parameter between 0 and 1
+
+        Returns:
+            torch.Tensor: Scale parameter sigma(t)
+
+        Raises:
+            ValueError: If t is outside [0, 1]
         """
         if not type(t) == torch.Tensor:
             t = torch.tensor(t)
@@ -395,14 +484,27 @@ class IGSO3:
         return self.igso3_vals["exp_score_norms"][sigma_idcs]
 
     def diffuse_frames(self, xyz, t_list, diffusion_mask=None):
-        """diffuse_frames samples from the IGSO(3) distribution to noise frames
+        """
+        Add rotational noise to protein backbone frames using IGSO3 diffusion.
 
-        Parameters:
-            xyz (np.array or torch.tensor, required): (L,3,3) set of backbone coordinates
-            mask (np.array or torch.tensor, required): (L,) set of bools. True/1 is NOT diffused, False/0 IS diffused
+        This function samples rotation vectors from the IGSO3 distribution and applies
+        them to the local coordinate frames defined by the backbone N-CA-C atoms. The
+        rotations preserve the C-alpha positions while rotating the backbone orientation.
+
+        Args:
+            xyz (np.ndarray or torch.Tensor): Backbone coordinates of shape (L, 3, 3)
+                where L is sequence length and the 3 atoms are N, CA, C
+            t_list (list or None): List of specific timesteps to return. If None,
+                returns all T timesteps
+            diffusion_mask (np.ndarray, optional): Boolean mask of shape (L,) where
+                True means do NOT diffuse this residue (e.g., for motif scaffolding)
+
         Returns:
-            np.array : N/CA/C coordinates for each residue
-                        (T,L,3,3), where T is num timesteps
+            tuple: (perturbed_coords, R_perturbed)
+                - perturbed_coords: Noised backbone coordinates (L, T, 3, 3) or
+                    (L, len(t_list), 3, 3) if t_list is provided
+                - R_perturbed: Rotation matrices applied (L, T, 3, 3) or
+                    (L, len(t_list), 3, 3)
         """
 
         if torch.is_tensor(xyz):
@@ -454,44 +556,43 @@ class IGSO3:
     def reverse_sample_vectorized(
         self, R_t, R_0, t, noise_level, mask=None, return_perturb=False
     ):
-        """reverse_sample uses an approximation to the IGSO3 score to sample
-        a rotation at the previous time step.
+        """
+        Sample from the reverse diffusion process to denoise rotations.
 
-        Roughly - this update follows the reverse time SDE for Reimannian
-        manifolds proposed by de Bortoli et al. Theorem 1 [1]. But with an
-        approximation to the score based on the prediction of R0.
-        Unlike in reference [1], this diffusion on SO(3) relies on geometric
-        variance schedule.  Specifically we follow [2] (appendix C) and assume
-            sigma_t = sigma_min * (sigma_max / sigma_min)^{t/T},
-        for time step t.  When we view this as a discretization  of the SDE
-        from time 0 to 1 with step size (1/T).  Following Eq. 5 and Eq. 6,
-        this maps on to the forward  time SDEs
-            dx = g(t) dBt [FORWARD]
-        and
-            dx = g(t)^2 score(xt, t)dt + g(t) B't, [REVERSE]
-        where g(t) = sigma_t * sqrt(2 * log(sigma_max/ sigma_min)), and Bt and
-        B't are Brownian motions. The formula for g(t) obtains from equation 9
-        of [2], from which this sampling function may be generalized to
-        alternative noising schedules.
+        This implements one step of the reverse-time SDE for SO(3) diffusion,
+        sampling R_{t-1} given R_t and a prediction of R_0. The method approximates
+        the score function using the predicted clean rotation R_0, following the
+        approach of de Bortoli et al. for Riemannian manifolds.
+
+        The reverse SDE is: dR = g(t)^2 * score(R_t, t) * dt + g(t) * dB_t
+        where g(t) is the drift coefficient and score is approximated from R_0.
+
+        Implementation details:
+        1. Compute rotation from R_t to predicted R_0 as a rotation vector
+        2. Approximate the score using the norm of this rotation vector
+        3. Add both deterministic drift and stochastic noise terms
+        4. Apply the resulting perturbation to R_t
+
         Args:
-            R_t: noisy rotation of shape [N, 3, 3]
-            R_0: prediction of un-noised rotation
-            t: integer time step
-            noise_level: scaling on the noise added when obtaining sample
-                (preliminary performance seems empirically better with noise
-                level=0.5)
-            mask: whether the residue is to be updated.  A value of 1 means the
-                rotation is not updated from r_t.  A value of 0 means the
-                rotation is updated.
-        Return:
-            sampled rotation matrix for time t-1 of shape [3, 3]
-        Reference:
-        [1] De Bortoli, V., Mathieu, E., Hutchinson, M., Thornton, J., Teh, Y.
-        W., & Doucet, A. (2022). Riemannian score-based generative modeling.
-        arXiv preprint arXiv:2202.02763.
-        [2] Song, Y., Sohl-Dickstein, J., Kingma, D. P., Kumar, A., Ermon, S.,
-        & Poole, B. (2020). Score-based generative modeling through stochastic
-        differential equations. arXiv preprint arXiv:2011.13456.
+            R_t (torch.Tensor): Current noisy rotations of shape (N, 3, 3)
+            R_0 (torch.Tensor): Predicted clean rotations of shape (N, 3, 3)
+            t (int): Current timestep (1-indexed)
+            noise_level (float): Scaling factor for stochastic noise. Values around
+                0.5 often work well empirically
+            mask (torch.Tensor, optional): Update mask of shape (N,) where 1 means
+                do NOT update (keep R_t), 0 means do update
+            return_perturb (bool, optional): If True, return only the perturbation
+                matrix instead of the updated rotation
+
+        Returns:
+            torch.Tensor: Sampled rotation for timestep t-1 of shape (N, 3, 3), or
+                perturbation matrix if return_perturb=True
+
+        References:
+            [1] De Bortoli et al. (2022). Riemannian score-based generative modeling.
+                arXiv:2202.02763
+            [2] Song et al. (2020). Score-based generative modeling through stochastic
+                differential equations. arXiv:2011.13456
         """
         # compute rotation vector corresponding to prediction of how r_t goes to r_0
         R_0, R_t = torch.tensor(R_0), torch.tensor(R_t)
@@ -538,7 +639,26 @@ class IGSO3:
 
 
 class Diffuser:
-    # wrapper for yielding diffused coordinates
+    """
+    Combined diffuser for both translation and rotation of protein structures.
+
+    This class wraps both EuclideanDiffuser (for C-alpha translations) and IGSO3
+    (for backbone frame rotations) into a single interface. It handles the full
+    diffusion process for protein structures, including:
+    - Translational noise on C-alpha coordinates
+    - Rotational noise on backbone frames (N-CA-C orientations)
+    - Proper scaling and centering of coordinates
+    - Support for motif scaffolding (freezing parts of the structure)
+
+    Attributes:
+        T (int): Number of diffusion timesteps
+        b_0, b_T (float): Beta schedule parameters for translation
+        min_sigma, max_sigma (float): Sigma parameters for rotation
+        crd_scale (float): Coordinate scaling factor
+        var_scale (float): Variance scaling factor
+        so3_diffuser (IGSO3): Diffuser for rotations
+        eucl_diffuser (EuclideanDiffuser): Diffuser for translations
+    """
 
     def __init__(
         self,
@@ -607,22 +727,37 @@ class Diffuser:
         t_list=None,
     ):
         """
-        Given full atom xyz, sequence and atom mask, diffuse the protein frame
-        translations and rotations
+        Apply full diffusion to protein structure (both translation and rotation).
 
-        Parameters:
+        This is the main interface for adding noise to a protein structure. It combines
+        translational diffusion of C-alpha atoms with rotational diffusion of backbone
+        frames to create a fully noised structure trajectory.
 
-            xyz (L,14/27,3) set of coordinates
+        The process:
+        1. Center the structure (or center on motif if present)
+        2. Scale coordinates
+        3. Diffuse C-alpha positions via Euclidean diffusion
+        4. Diffuse backbone orientations via SO(3) diffusion
+        5. Combine translation and rotation to get full-atom coordinates
+        6. Optionally preserve motif sidechain coordinates
 
-            seq (L,) integer sequence
+        Args:
+            xyz (torch.Tensor): Full-atom coordinates of shape (L, 14 or 27, 3) where
+                L is sequence length, 14/27 is number of atoms per residue
+            seq (torch.Tensor): Amino acid sequence as integers of shape (L,)
+            atom_mask (torch.Tensor): Mask indicating which atoms are present (L, 14/27)
+            include_motif_sidechains (bool, optional): If True, preserve sidechain
+                coordinates for motif residues. Default is True
+            diffusion_mask (torch.Tensor, optional): Boolean mask of shape (L,) where
+                True means do NOT diffuse this residue (for motif scaffolding)
+            t_list (list, optional): Specific timesteps to return. If None, returns
+                all T timesteps
 
-            atom_mask: mask describing presence/absence of an atom in pdb
-
-            diffusion_mask (torch.tensor, optional): Tensor of bools, True means NOT diffused at this residue, False means diffused
-
-            t_list (list, optional): If present, only return the diffused coordinates at timesteps t within the list
-
-
+        Returns:
+            tuple: (diffused_structures, xyz_true)
+                - diffused_structures: Noised full-atom coordinates of shape
+                    (T, L, 27, 3) or (len(t_list), L, 27, 3)
+                - xyz_true: Original centered coordinates (L, 27, 3)
         """
 
         if diffusion_mask is None:

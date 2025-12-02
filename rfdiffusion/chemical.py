@@ -1,6 +1,15 @@
+"""
+Chemical and biochemical constants for protein structure modeling.
+
+This module defines amino acid properties, atom representations, and chemical
+constants used throughout RFdiffusion for protein structure manipulation.
+"""
+
 import torch
 import numpy as np
 
+# Mapping from amino acid index to 3-letter amino acid code
+# Indices 0-19 are standard amino acids, 20 is unknown (UNK), 21 is masked (MAS)
 num2aa=[
     'ALA','ARG','ASN','ASP','CYS',
     'GLN','GLU','GLY','HIS','ILE',
@@ -15,18 +24,32 @@ one_letter = ["A", "R", "N", "D", "C", \
              "L", "K", "M", "F", "P", \
              "S", "T", "W", "Y", "V", "?", "-"]
 
+# Reverse mapping from 3-letter AA code to index
 aa2num= {x:i for i,x in enumerate(num2aa)}
 
+# Mapping from 3-letter to 1-letter amino acid codes (e.g., ALA -> A)
 aa_321 = {a:b for a,b in zip(num2aa,one_letter)}
+# Reverse mapping from 1-letter to 3-letter codes (e.g., A -> ALA)
 aa_123 = {val:key for key,val in aa_321.items()}
 
 
-# create single letter code string from parsed integer sequence
 def seq2chars(seq):
+    """
+    Convert integer sequence to single-letter amino acid codes.
+
+    Args:
+        seq: List or array of amino acid indices
+
+    Returns:
+        String of single-letter amino acid codes
+    """
     out = ''.join([aa_321[num2aa[a]] for a in seq])
     return out
 
-# full sc atom representation (Nx14)
+# Full sidechain atom representation (Nx27) including hydrogens
+# Each tuple contains atom names for a specific amino acid in order
+# First 14 are heavy atoms, last 13 are hydrogens
+# None indicates position not used for that amino acid
 aa2long=[
     (" N  "," CA "," C  "," O  "," CB ",  None,  None,  None,  None,  None,  None,  None,  None,  None," H  "," HA ","1HB ","2HB ","3HB ",  None,  None,  None,  None,  None,  None,  None,  None), # ala
     (" N  "," CA "," C  "," O  "," CB "," CG "," CD "," NE "," CZ "," NH1"," NH2",  None,  None,  None," H  "," HA ","1HB ","2HB ","1HG ","2HG ","1HD ","2HD "," HE ","1HH1","2HH1","1HH2","2HH2"), # arg
@@ -52,7 +75,8 @@ aa2long=[
     (" N  "," CA "," C  "," O  "," CB ",  None,  None,  None,  None,  None,  None,  None,  None,  None," H  "," HA ","1HB ","2HB ","3HB ",  None,  None,  None,  None,  None,  None,  None,  None), # mask
 ]
 
-# build the "alternate" sc mapping
+# Alternate sidechain atom mapping for symmetric sidechains
+# Used to handle ambiguous atom naming (e.g., swapped OD1/OD2 in ASP)
 aa2longalt=[
     (" N  "," CA "," C  "," O  "," CB ",  None,  None,  None,  None,  None,  None,  None,  None,  None," H  "," HA ","1HB ","2HB ","3HB ",  None,  None,  None,  None,  None,  None,  None,  None), # ala
     (" N  "," CA "," C  "," O  "," CB "," CG "," CD "," NE "," CZ "," NH1"," NH2",  None,  None,  None," H  "," HA ","1HB ","2HB ","1HG ","2HG ","1HD ","2HD "," HE ","1HH1","2HH1","1HH2","2HH2"), # arg
@@ -78,6 +102,8 @@ aa2longalt=[
     (" N  "," CA "," C  "," O  "," CB ",  None,  None,  None,  None,  None,  None,  None,  None,  None," H  "," HA ","1HB ","2HB ","3HB ",  None,  None,  None,  None,  None,  None,  None,  None), # mask
 ]
 
+# Bond connectivity for each amino acid
+# List of tuples defining which atoms are bonded to each other
 aabonds=[
     ((" N  "," CA "),(" N  "," H  "),(" CA "," C  "),(" CA "," CB "),(" CA "," HA "),(" C  "," O  "),(" CB ","1HB "),(" CB ","2HB "),(" CB ","3HB ")) , # ala
     ((" N  "," CA "),(" N  "," H  "),(" CA "," C  "),(" CA "," CB "),(" CA "," HA "),(" C  "," O  "),(" CB "," CG "),(" CB ","1HB "),(" CB ","2HB "),(" CG "," CD "),(" CG ","1HG "),(" CG ","2HG "),(" CD "," NE "),(" CD ","1HD "),(" CD ","2HD "),(" NE "," CZ "),(" NE "," HE "),(" CZ "," NH1"),(" CZ "," NH2"),(" NH1","1HH1"),(" NH1","2HH1"),(" NH2","1HH2"),(" NH2","2HH2")) , # arg
@@ -103,6 +129,8 @@ aabonds=[
     ((" N  "," CA "),(" N  "," H  "),(" CA "," C  "),(" CA "," CB "),(" CA "," HA "),(" C  "," O  "),(" CB ","1HB "),(" CB ","2HB "),(" CB ","3HB ")) , # mask
 ]
 
+# Atom type classification for each atom in each amino acid
+# Used for scoring functions (LJ/LK potentials, hydrogen bonding)
 aa2type = [
     ("Nbb", "CAbb","CObb","OCbb","CH3",   None,  None,  None,  None,  None,  None,  None,  None,  None,"HNbb","Hapo","Hapo","Hapo","Hapo",  None,  None,  None,  None,  None,  None,  None,  None), # ala
     ("Nbb", "CAbb","CObb","OCbb","CH2", "CH2", "CH2", "NtrR","aroC","Narg","Narg",  None,  None,  None,"HNbb","Hapo","Hapo","Hapo","Hapo","Hapo","Hapo","Hapo","Hpol","Hpol","Hpol","Hpol","Hpol"), # arg
@@ -128,7 +156,8 @@ aa2type = [
     ("Nbb", "CAbb","CObb","OCbb","CH3",   None,  None,  None,  None,  None,  None,  None,  None,  None,"HNbb","Hapo","Hapo","Hapo","Hapo",  None,  None,  None,  None,  None,  None,  None,  None), # mask
 ]
 
-# tip atom
+# Tip atom for each amino acid (furthest atom from backbone)
+# Used for defining sidechain orientation and contact detection
 aa2tip = [
         " CB ", # ala
         " CZ ", # arg
@@ -155,6 +184,9 @@ aa2tip = [
         ]
 
 
+# Torsion angle definitions (chi angles) for each amino acid
+# Each entry defines the 4 atoms used to calculate up to 4 chi angles
+# None indicates the amino acid doesn't have that particular chi angle
 torsions=[
     [ None, None, None, None ],  # ala
     [ [" N  "," CA "," CB "," CG "], [" CA "," CB "," CG "," CD "], [" CB "," CG "," CD "," NE "], [" CG "," CD "," NE "," CZ "] ],  # arg
@@ -180,19 +212,22 @@ torsions=[
     [ None, None, None, None ],  # mask
 ]
 
-# ideal N, CA, C initial coordinates
+# Ideal backbone N, CA, C coordinates in local frame
+# Used as reference geometry for protein structure building
 init_N = torch.tensor([-0.5272, 1.3593, 0.000]).float()
-init_CA = torch.zeros_like(init_N)
+init_CA = torch.zeros_like(init_N)  # CA at origin
 init_C = torch.tensor([1.5233, 0.000, 0.000]).float()
 INIT_CRDS = torch.full((27, 3), np.nan)
 INIT_CRDS[:3] = torch.stack((init_N, init_CA, init_C), dim=0) # (3,3)
 
+# Calculate ideal N-CA-C bond angle (used for non-ideal geometry correction)
 norm_N = init_N / (torch.norm(init_N, dim=-1, keepdim=True) + 1e-5)
 norm_C = init_C / (torch.norm(init_C, dim=-1, keepdim=True) + 1e-5)
 cos_ideal_NCAC = torch.sum(norm_N*norm_C, dim=-1) # cosine of ideal N-CA-C bond angle
 
-#fd Rosetta ideal coords
-#fd   - uses same "frame-building" as AF2
+# Rosetta ideal coordinates for all atoms in each amino acid
+# Uses same frame-building approach as AlphaFold2
+# Format: [atom_name, base_frame_index, (x, y, z)]
 ideal_coords = [
     [ # 0 ala
         [' N  ', 0, (-0.5272, 1.3593, 0.000)],

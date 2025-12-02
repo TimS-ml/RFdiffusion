@@ -1,34 +1,57 @@
+"""
+Potential energy functions for guided protein structure generation.
+
+This module implements various differentiable potential functions that guide
+the diffusion process toward desired structural properties. Potentials include:
+- Radius of gyration (compactness)
+- Contact numbers (intra-protein, interface, oligomer)
+- Substrate/ligand interactions
+
+All potentials return values to be MAXIMIZED (negative for energies to minimize).
+"""
 import torch
-import numpy as np 
+import numpy as np
 from rfdiffusion.util import generate_Cbeta
 
 class Potential:
-    '''
-        Interface class that defines the functions a potential must implement
-    '''
+    """
+    Base class interface for potential energy functions.
+
+    All potential implementations must inherit from this class and implement
+    the compute() method.
+    """
 
     def compute(self, xyz):
-        '''
-            Given the current structure of the model prediction, return the current
-            potential as a PyTorch tensor with a single entry
+        """
+        Compute the potential energy for the current structure.
 
-            Args:
-                xyz (torch.tensor, size: [L,27,3]: The current coordinates of the sample
-            
-            Returns:
-                potential (torch.tensor, size: [1]): A potential whose value will be MAXIMIZED
-                                                     by taking a step along it's gradient
-        '''
+        Args:
+            xyz (torch.Tensor): Current coordinates [L, 27, 3]
+
+        Returns:
+            torch.Tensor: Scalar potential value to be MAXIMIZED
+                         (take gradient ascent steps)
+        """
         raise NotImplementedError('Potential compute function was not overwritten')
 
 class monomer_ROG(Potential):
-    '''
-        Radius of Gyration potential for encouraging monomer compactness
+    """
+    Radius of gyration potential for monomer compactness.
 
-        Written by DJ and refactored into a class by NRB
-    '''
+    Encourages the structure to be compact by penalizing large radius of gyration.
+    Distances below min_dist are not penalized to avoid over-compaction.
+
+    Author: DJ (refactored by NRB)
+    """
 
     def __init__(self, weight=1, min_dist=15):
+        """
+        Initialize monomer ROG potential.
+
+        Args:
+            weight (float): Scaling factor for the potential
+            min_dist (float): Minimum distance from centroid (not penalized below this)
+        """
 
         self.weight   = weight
         self.min_dist = min_dist
@@ -47,13 +70,23 @@ class monomer_ROG(Potential):
         return -1 * self.weight * rad_of_gyration
 
 class binder_ROG(Potential):
-    '''
-        Radius of Gyration potential for encouraging binder compactness
+    """
+    Radius of gyration potential for binder chain compactness.
 
-        Author: NRB
-    '''
+    Similar to monomer_ROG but only considers the binder portion of a complex.
+
+    Author: NRB
+    """
 
     def __init__(self, binderlen, weight=1, min_dist=15):
+        """
+        Initialize binder ROG potential.
+
+        Args:
+            binderlen (int): Length of the binder chain
+            weight (float): Scaling factor
+            min_dist (float): Minimum distance threshold
+        """
 
         self.binderlen = binderlen
         self.min_dist  = min_dist
@@ -77,13 +110,24 @@ class binder_ROG(Potential):
 
 
 class dimer_ROG(Potential):
-    '''
-        Radius of Gyration potential for encouraging compactness of both monomers when designing dimers
+    """
+    Radius of gyration potential for symmetric dimer compactness.
 
-        Author: PV
-    '''
+    Encourages both monomers in a dimer to be compact by averaging their
+    individual ROG penalties.
+
+    Author: PV
+    """
 
     def __init__(self, binderlen, weight=1, min_dist=15):
+        """
+        Initialize dimer ROG potential.
+
+        Args:
+            binderlen (int): Length of each monomer
+            weight (float): Scaling factor
+            min_dist (float): Minimum distance threshold
+        """
 
         self.binderlen = binderlen
         self.min_dist  = min_dist
@@ -116,14 +160,25 @@ class dimer_ROG(Potential):
         return -1 * self.weight * (rad_of_gyration_m1 + rad_of_gyration_m2)/2
 
 class binder_ncontacts(Potential):
-    '''
-        Differentiable way to maximise number of contacts within a protein
-        
-        Motivation is given here: https://www.plumed.org/doc-v2.7/user-doc/html/_c_o_o_r_d_i_n_a_t_i_o_n.html
+    """
+    Differentiable contact number potential for binder compactness.
 
-    '''
+    Uses a smooth switching function to count contacts, similar to PLUMED's
+    coordination number. Encourages formation of contacts within the binder.
+
+    Reference: https://www.plumed.org/doc-v2.7/user-doc/html/_c_o_o_r_d_i_n_a_t_i_o_n.html
+    """
 
     def __init__(self, binderlen, weight=1, r_0=8, d_0=4):
+        """
+        Initialize binder contact potential.
+
+        Args:
+            binderlen (int): Length of binder chain
+            weight (float): Scaling factor
+            r_0 (float): Distance scaling parameter
+            d_0 (float): Distance offset parameter
+        """
 
         self.binderlen = binderlen
         self.r_0       = r_0
@@ -147,17 +202,27 @@ class binder_ncontacts(Potential):
         return self.weight * binder_ncontacts.sum()
 
 class interface_ncontacts(Potential):
+    """
+    Contact potential for binder-target interface.
 
-    '''
-        Differentiable way to maximise number of contacts between binder and target
-        
-        Motivation is given here: https://www.plumed.org/doc-v2.7/user-doc/html/_c_o_o_r_d_i_n_a_t_i_o_n.html
+    Encourages formation of contacts across the interface between binder
+    and target using a differentiable coordination number.
 
-        Author: PV
-    '''
+    Reference: https://www.plumed.org/doc-v2.7/user-doc/html/_c_o_o_r_d_i_n_a_t_i_o_n.html
 
+    Author: PV
+    """
 
     def __init__(self, binderlen, weight=1, r_0=8, d_0=6):
+        """
+        Initialize interface contact potential.
+
+        Args:
+            binderlen (int): Length of binder chain
+            weight (float): Scaling factor
+            r_0 (float): Distance scaling parameter
+            d_0 (float): Distance offset parameter
+        """
 
         self.binderlen = binderlen
         self.r_0       = r_0
@@ -187,16 +252,30 @@ class interface_ncontacts(Potential):
 
 
 class monomer_contacts(Potential):
-    '''
-        Differentiable way to maximise number of contacts within a protein
+    """
+    Contact potential for monomer self-interactions.
 
-        Motivation is given here: https://www.plumed.org/doc-v2.7/user-doc/html/_c_o_o_r_d_i_n_a_t_i_o_n.html
-        Author: PV
+    Encourages formation of intra-protein contacts using a differentiable
+    coordination number for the entire protein.
 
-        NOTE: This function sometimes produces NaN's -- added check in reverse diffusion for nan grads
-    '''
+    Reference: https://www.plumed.org/doc-v2.7/user-doc/html/_c_o_o_r_d_i_n_a_t_i_o_n.html
+
+    Author: PV
+
+    Note: This function sometimes produces NaN gradients - there is a check
+          in reverse diffusion to handle this.
+    """
 
     def __init__(self, weight=1, r_0=8, d_0=2, eps=1e-6):
+        """
+        Initialize monomer contact potential.
+
+        Args:
+            weight (float): Scaling factor
+            r_0 (float): Distance scaling parameter
+            d_0 (float): Distance offset parameter
+            eps (float): Small constant for numerical stability
+        """
 
         self.r_0       = r_0
         self.weight    = weight
@@ -222,26 +301,29 @@ class monomer_contacts(Potential):
 
 class olig_contacts(Potential):
     """
-    Applies PV's num contacts potential within/between chains in symmetric oligomers 
+    Contact potential for symmetric oligomers with custom inter/intra-chain rules.
 
-    Author: DJ 
+    Applies contact potentials within and between chains in symmetric assemblies.
+    Can specify attractive/repulsive interactions between specific chain pairs.
+
+    Author: DJ
     """
 
-    def __init__(self, 
-                 contact_matrix, 
-                 weight_intra=1, 
+    def __init__(self,
+                 contact_matrix,
+                 weight_intra=1,
                  weight_inter=1,
                  r_0=8, d_0=2):
         """
-        Parameters:
-            chain_lengths (list, required): List of chain lengths, length is (Nchains)
+        Initialize oligomer contact potential.
 
-            contact_matrix (torch.tensor/np.array, required): 
-                square matrix of shape (Nchains,Nchains) whose (i,j) enry represents 
-                attractive (1), repulsive (-1), or non-existent (0) contact potentials 
-                between chains in the complex
-
-            weight (int/float, optional): Scaling/weighting factor
+        Args:
+            contact_matrix (np.ndarray): Square matrix [Nchains, Nchains] where
+                entry (i,j) is 1 (attractive), -1 (repulsive), or 0 (no potential)
+            weight_intra (float): Weight for intra-chain contacts
+            weight_inter (float): Weight for inter-chain contacts
+            r_0 (float): Distance scaling parameter
+            d_0 (float): Distance offset parameter
         """
         self.contact_matrix = contact_matrix
         self.weight_intra = weight_intra 
@@ -330,6 +412,19 @@ def mask_expand(mask, n=1):
     return mask_out
 
 def contact_energy(dgram, d_0, r_0):
+    """
+    Compute smooth contact energy from distance matrix.
+
+    Uses a switching function to smoothly count contacts.
+
+    Args:
+        dgram (torch.Tensor): Distance matrix
+        d_0 (float): Distance offset
+        r_0 (float): Distance scale
+
+    Returns:
+        torch.Tensor: Negative contact count (to maximize)
+    """
     divide_by_r_0 = (dgram - d_0) / r_0
     numerator = torch.pow(divide_by_r_0,6)
     denominator = torch.pow(divide_by_r_0,12)
@@ -338,6 +433,18 @@ def contact_energy(dgram, d_0, r_0):
     return - ncontacts
 
 def poly_repulse(dgram, r, slope, p=1):
+    """
+    Polynomial repulsion potential for close contacts.
+
+    Args:
+        dgram (torch.Tensor): Distance matrix
+        r (float): Cutoff distance
+        slope (float): Steepness of repulsion
+        p (float): Power for polynomial
+
+    Returns:
+        torch.Tensor: Repulsive energy
+    """
     a = slope / (p * r**(p-1))
 
     return (dgram < r) * a * torch.abs(r - dgram)**p * slope
@@ -346,11 +453,28 @@ def poly_repulse(dgram, r, slope, p=1):
 
 
 class substrate_contacts(Potential):
-    '''
-    Implicitly models a ligand with an attractive-repulsive potential.
-    '''
+    """
+    Potential for substrate/ligand binding site design.
+
+    Implicitly models a ligand using attractive-repulsive potentials to guide
+    the formation of binding sites. Uses affine transformations to track ligand
+    position relative to motif residues.
+    """
 
     def __init__(self, weight=1, r_0=8, d_0=2, s=1, eps=1e-6, rep_r_0=5, rep_s=2, rep_r_min=1):
+        """
+        Initialize substrate contact potential.
+
+        Args:
+            weight (float): Overall scaling factor
+            r_0 (float): Distance scale for attractive potential
+            d_0 (float): Distance offset for attractive potential
+            s (float): Strength of attractive potential
+            eps (float): Numerical stability constant
+            rep_r_0 (float): Distance scale for repulsive potential
+            rep_s (float): Strength of repulsive potential
+            rep_r_min (float): Minimum distance for repulsion
+        """
 
         self.r_0       = r_0
         self.weight    = weight
@@ -454,9 +578,8 @@ class substrate_contacts(Potential):
             self.motif_frame = xyz[rand_idx[0],:4]
             self.motif_mapping = [(rand_idx, i) for i in range(4)]
 
-# Dictionary of types of potentials indexed by name of potential. Used by PotentialManager.
-# If you implement a new potential you must add it to this dictionary for it to be used by
-# the PotentialManager
+# Dictionary mapping potential names to classes. Used by PotentialManager.
+# New potentials must be added here to be accessible via configuration strings.
 implemented_potentials = { 'monomer_ROG':          monomer_ROG,
                            'binder_ROG':           binder_ROG,
                            'dimer_ROG':            dimer_ROG,
@@ -466,6 +589,7 @@ implemented_potentials = { 'monomer_ROG':          monomer_ROG,
                            'olig_contacts':        olig_contacts,
                            'substrate_contacts':    substrate_contacts}
 
+# Set of potentials that require binderlen parameter
 require_binderlen      = { 'binder_ROG',
                            'binder_distance_ReLU',
                            'binder_any_ReLU',
